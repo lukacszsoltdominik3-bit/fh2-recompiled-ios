@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
 #include <algorithm>
 #include <string>
 
@@ -348,6 +349,13 @@ void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cs_ptr)
 }
 
 void RtlInitializeCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+  if (!cs.guest_address()) {
+    static std::atomic<int> warned{0};
+    if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
+      REXKRNL_WARN("{}: null critical section from guest; ignored", "RtlInitializeCriticalSection");
+    }
+    return;
+  }
   REXKRNL_IMPORT_TRACE("RtlInitializeCriticalSection", "cs={:#x}", cs.guest_address());
   xeRtlInitializeCriticalSection(cs, cs.guest_address());
 }
@@ -373,10 +381,24 @@ X_STATUS xeRtlInitializeCriticalSectionAndSpinCount(X_RTL_CRITICAL_SECTION* cs, 
 
 u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs,
                                                    u32 spin_count) {
+  if (!cs.guest_address()) {
+    static std::atomic<int> warned{0};
+    if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
+      REXKRNL_WARN("{}: null critical section from guest; ignored", "RtlInitializeCriticalSectionAndSpinCount");
+    }
+    return X_STATUS_SUCCESS;
+  }
   return xeRtlInitializeCriticalSectionAndSpinCount(cs, cs.guest_address(), spin_count);
 }
 
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+  if (!cs.guest_address()) {
+    static std::atomic<int> warned{0};
+    if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
+      REXKRNL_WARN("{}: null critical section from guest; ignored", "RtlEnterCriticalSection");
+    }
+    return;
+  }
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
   uint32_t spin_count = cs->header.absolute * 256;
 
@@ -408,6 +430,13 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 
 u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+  if (!cs.guest_address()) {
+    static std::atomic<int> warned{0};
+    if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
+      REXKRNL_WARN("{}: null critical section from guest; ignored", "RtlTryEnterCriticalSection");
+    }
+    return 1;
+  }
   uint32_t thread = XThread::GetCurrentThread()->guest_object();
 
   if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
@@ -427,6 +456,13 @@ u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 
 void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+  if (!cs.guest_address()) {
+    static std::atomic<int> warned{0};
+    if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
+      REXKRNL_WARN("{}: null critical section from guest; ignored", "RtlLeaveCriticalSection");
+    }
+    return;
+  }
   assert_true(cs->owning_thread == XThread::GetCurrentThread()->guest_object());
 
   // Drop recursion count - if it isn't zero we still have the lock.

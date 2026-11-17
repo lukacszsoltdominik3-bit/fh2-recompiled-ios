@@ -76,7 +76,11 @@ extern "C" void RexSwitchPerfTiron(uint64_t inicio, uint64_t fin);
 // overlay; -1 until the first half second.
 std::atomic<float> g_fh2_nativo_fps{-1.0f};
 // Android's performance hints (android/app/src/main/cpp/android_rendimiento.cpp); absent on the PC.
+#if defined(__ANDROID__)
 extern "C" void fh2_android_fotograma(int64_t periodo_ns) __attribute__((weak));
+#else
+extern "C" inline void fh2_android_fotograma(int64_t) {}
+#endif
 std::atomic<float> g_fh2_nativo_ms{-1.0f};
 // GPU nanoseconds of the measured submissions, accumulated, for the overlay's "GPU %" on phones whose kernel GPU
 // load files cannot be read (Android 16 on MediaTek: no GED, no devfreq); -1 without timestamps.

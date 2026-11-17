@@ -56,6 +56,31 @@ if(ANDROID)
     set_target_properties(fh2 PROPERTIES OUTPUT_NAME main)
 elseif(WIN32)
     add_executable(fh2 WIN32 ${FH2_SOURCES})
+elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/ios/Info.plist"
+        @ONLY)
+    add_executable(fh2 MACOSX_BUNDLE ${FH2_SOURCES})
+    set_target_properties(fh2 PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/ios/Info.plist"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "${FH2_IOS_BUNDLE_IDENTIFIER}"
+        MACOSX_BUNDLE_BUNDLE_NAME "fh2"
+        MACOSX_BUNDLE_BUNDLE_VERSION "1.0"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+        XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
+        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${FH2_IOS_BUNDLE_IDENTIFIER}"
+        XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
+    )
+    # App icon: one 1024x1024 image in the asset catalog (Xcode derives every size). The PNG
+    # itself is local only (.gitignore); without it the catalog still builds, with no icon.
+    target_sources(fh2 PRIVATE ios/Assets.xcassets)
+    set_source_files_properties(ios/Assets.xcassets PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    # On-screen touch gamepad: UIKit overlay + virtual pad input driver.
+    enable_language(OBJCXX)
+    target_sources(fh2 PRIVATE ios/fh2_touch_controls.mm src/fh2_touch_pad.cpp)
+    set_source_files_properties(ios/fh2_touch_controls.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_include_directories(fh2 PRIVATE ios)
 else()
     add_executable(fh2 ${FH2_SOURCES})
 endif()

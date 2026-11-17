@@ -16,8 +16,11 @@
 #include <atomic>
 #if defined(__linux__)
 #include <sys/resource.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
 #endif
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
@@ -100,6 +103,31 @@ REXCVAR_DEFINE_STRING(gpu_traco_despejo_extra, "", "GPU/Vulkan",
                       "Debug: extra guest memory written with the frame trace dumps, as "
                       "\"<address hex>:<bytes>[,...]\" (for example a texture: \"1394E000:65536\")")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(readback_resolve_max_bytes, 0, "GPU/Vulkan",
+                     "With readback_resolve on: only resolves of at most this many bytes are read "
+                     "back to guest memory (0 = all)");
+REXCVAR_DEFINE_BOOL(gpu_uploads_antecipados, false, "GPU/Vulkan",
+                    "Copies of guest memory the CPU changed (shared memory uploads) at the start of the "
+                    "submission when no command recorded before them in it touched those pages, instead of in "
+                    "place: no render pass end for each (a tile store and load on a mobile GPU, a new Metal "
+                    "encoder in MoltenVK). iPhone: ~360 of ~400 render pass ends a frame were uploads");
+REXCVAR_DEFINE_BOOL(occlusion_query_assincrono, false, "GPU/Vulkan",
+                    "Occlusion queries without a CPU-GPU sync: the end of a query gives the game the last "
+                    "result read for that query (one frame or so late; the first time, "
+                    "query_occlusion_fake_sample_count) and reads the new one when its submission is done. "
+                    "Otherwise every query ends the submission and waits for the whole GPU queue (iPhone, sun "
+                    "in view: ~40 ms a frame)");
+REXCVAR_DEFINE_INT32(readback_resolve_formato, -1, "GPU/Vulkan",
+                     "With readback_resolve on: only resolves to this destination texture format "
+                     "are read back to guest memory (-1 = all; 36 = k_32_FLOAT)");
+REXCVAR_DEFINE_BOOL(gpu_rotulos, false, "GPU/Vulkan",
+                    "Debug: insert a debug label (a Metal signpost under MoltenVK) after every draw, "
+                    "texture load, resolve and compute dispatch, so a GPU hang report (with "
+                    "MVK_CONFIG_DEBUG) names the operation that hung");
+REXCVAR_DEFINE_STRING(gpu_pular_shaders, "", "GPU/Vulkan",
+                      "Skip every draw that uses one of these shader hashes (vertex or pixel, hex, "
+                      "comma-separated) - for bisecting host GPU hangs")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(gpu_traco_quadros, 1, "GPU/Vulkan",
                      "Debug: number of frames traced by gpu_traco_quadro_s")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -122,6 +150,10 @@ struct FrameTrace {
   };
   std::vector<Dump> dumps;
   int dump_in_swaps = -1;
+  // On-demand captures: a file named fh2/traco_agora (pushed while the game runs) starts a new
+  // trace at the next swap; each capture dumps into traco_despejo_<n>.
+  uint32_t capture_index = 0;
+  uint32_t swaps_since_poll = 0;
 };
 FrameTrace g_frame_trace;
 
@@ -149,6 +181,8 @@ REXCVAR_DEFINE_INT32(gpu_log_quadros, 0, "GPU",
                      "Debug: log this many frames of resolves, texture loads and swaps in order ([quadro] lines), "
                      "starting gpu_log_quadros_apos_s seconds after the first frame");
 REXCVAR_DEFINE_INT32(gpu_log_quadros_apos_s, 90, "GPU", "Debug: see gpu_log_quadros");
+
+extern "C" std::atomic<bool> rex_app_background;  // src/ui/vulkan/vulkan_presenter.cpp
 
 namespace rex::graphics::vulkan {
 
@@ -661,6 +695,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
                                                system::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state),
       deferred_command_buffer_(*this),
+      upload_command_buffer_(*this, 64 * 1024),
       transient_descriptor_allocator_uniform_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -2449,6 +2484,22 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             cpu_before = cpu_now;
           }
         }
+#elif defined(__APPLE__)
+        {
+          static double cpu_before = -1.0;
+          thread_basic_info_data_t info{};
+          mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+          mach_port_t self = mach_thread_self();
+          if (thread_info(self, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) ==
+              KERN_SUCCESS) {
+            const double cpu_now = info.user_time.seconds * 1000.0 + info.user_time.microseconds / 1000.0 +
+                                   info.system_time.seconds * 1000.0 +
+                                   info.system_time.microseconds / 1000.0;
+            if (cpu_before >= 0.0) cp_cpu_ms = (cpu_now - cpu_before) / fps_frames;
+            cpu_before = cpu_now;
+          }
+          mach_port_deallocate(mach_task_self(), self);
+        }
 #endif
         REXGPU_INFO("fps: {:.1f} ({} frames in {:.1f} s, {:.1f} ms average, worst {:.1f} ms, CPU do processador "
                     "de comandos {:.1f} ms por quadro)",
@@ -2500,6 +2551,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         }
         REXGPU_INFO("transferencias por quadro: {:.1f} chamadas, {:.1f} draws de transferencia",
                     count(g_cp_times.transfer_calls), count(g_cp_times.transfer_draws));
+        REXGPU_INFO("passes de render por quadro: {:.1f} terminados; uploads de memoria: {:.1f} no lugar, "
+                    "{:.1f} antecipados ({:.0f} KB)",
+                    count(g_cp_times.render_passes_ended), count(g_cp_times.shm_uploads),
+                    count(g_cp_times.shm_uploads_hoisted),
+                    double(g_cp_times.shm_upload_bytes.exchange(0, std::memory_order_relaxed)) / 1024.0 *
+                        per_frame);
         REXGPU_INFO("atalho de resolve por quadro: {:.1f} resolves, {:.1f} texturas preenchidas, {:.2f} perdidos",
                     count(g_cp_times.atalho_resolves), count(g_cp_times.atalho_hits),
                     count(g_cp_times.atalho_misses));
@@ -2552,7 +2609,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         pos = end + 1;
       }
     }
-    std::filesystem::path folder = "traco_despejo";
+    std::filesystem::path folder =
+        g_frame_trace.capture_index
+            ? std::filesystem::path(fmt::format("traco_despejo_{}", g_frame_trace.capture_index))
+            : std::filesystem::path("traco_despejo");
     std::error_code ec;
     std::filesystem::create_directories(folder, ec);
     for (const auto& dump : g_frame_trace.dumps) {
@@ -2567,6 +2627,30 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     }
     REXGPU_INFO("[traco] {} resolve destinations written to {}", g_frame_trace.dumps.size(),
                 std::filesystem::absolute(folder).string());
+  }
+  if (!g_frame_trace.active && g_frame_trace.dump_in_swaps <= 0 &&
+      ++g_frame_trace.swaps_since_poll >= 30) {
+    g_frame_trace.swaps_since_poll = 0;
+    std::error_code trigger_ec;
+    // Only with gpu_traco_quadro_s set: the code that ends a capture runs only then, so a
+    // leftover trigger file in a normal run would otherwise start a trace that never ends (it
+    // logged every draw until the log rotation took the whole run). Without it the file is
+    // just discarded.
+    if (std::filesystem::remove("fh2/traco_agora", trigger_ec) &&
+        REXCVAR_GET(gpu_traco_quadro_s) > 0.0) {
+      ++g_frame_trace.capture_index;
+      g_frame_trace.dumps.clear();
+      g_frame_trace.dump_in_swaps = -1;
+      // The block below ends the capture; it runs only with gpu_traco_quadro_s > 0 and !done
+      // (set gpu_traco_quadro_s very high so only this trigger starts captures).
+      g_frame_trace.done = false;
+      g_frame_trace.active = true;
+      rex_frame_trace_active.store(true, std::memory_order_relaxed);
+      // +1: the end-of-frame check just below runs in this same swap and counts one frame.
+      g_frame_trace.frames_left = std::max(1, int(REXCVAR_GET(gpu_traco_quadros))) + 1;
+      g_frame_trace.draw_index = 0;
+      REXGPU_INFO("[traco] ---- start (on demand #{}) ----", g_frame_trace.capture_index);
+    }
   }
   if (REXCVAR_GET(gpu_traco_quadro_s) > 0.0 && !g_frame_trace.done) {
     if (g_frame_trace.active) {
@@ -3601,6 +3685,7 @@ void VulkanCommandProcessor::EndRenderPass() {
   } else {
     deferred_command_buffer_.CmdVkEndRenderPass();
   }
+  g_cp_times.render_passes_ended.fetch_add(1, std::memory_order_relaxed);
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
@@ -4037,6 +4122,34 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (!memexport_used_vertex) {
       // This draw has no effect.
       return true;
+    }
+  }
+  {
+    // gpu_pular_shaders: draws using any of the listed shader hashes (vertex or pixel) are
+    // skipped - to bisect GPU hangs and as a stopgap for a shader known to break the host GPU.
+    static const std::vector<uint64_t> skipped_shader_hashes = [] {
+      std::vector<uint64_t> hashes;
+      const std::string list = REXCVAR_GET(gpu_pular_shaders);
+      size_t pos = 0;
+      while (pos < list.size()) {
+        size_t end = list.find(',', pos);
+        if (end == std::string::npos) end = list.size();
+        unsigned long long hash = 0;
+        if (std::sscanf(list.substr(pos, end - pos).c_str(), "%llx", &hash) == 1 && hash) {
+          hashes.push_back(hash);
+          REXGPU_INFO("[teste] draws with shader {:016X} are skipped", hash);
+        }
+        pos = end + 1;
+      }
+      return hashes;
+    }();
+    if (!skipped_shader_hashes.empty()) {
+      for (uint64_t hash : skipped_shader_hashes) {
+        if (vertex_shader->ucode_data_hash() == hash ||
+            (pixel_shader && pixel_shader->ucode_data_hash() == hash)) {
+          return true;
+        }
+      }
     }
   }
   {
@@ -4704,6 +4817,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+  if (AreDebugLabelsEnabled()) {
+    static uint32_t label_draw_index = 0;
+    deferred_command_buffer_.CmdVkInsertDebugLabel(
+        fmt::format("D{} V{:016X} P{:016X} p{} n{} h{}", label_draw_index++,
+                    vertex_shader->ucode_data_hash(),
+                    pixel_shader ? pixel_shader->ucode_data_hash() : 0, uint32_t(prim_type),
+                    index_count, uint32_t(primitive_processing_result.host_vertex_shader_type))
+            .c_str());
+  }
 
   // Invalidate textures in memexported memory and watch for changes.
   if (!memexport_ranges_.empty()) {
@@ -4975,6 +5097,25 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
+  }
+  // readback_resolve_max_bytes: only small resolves reach guest memory - the ones the game's CPU
+  // reads (FH2: the 32x32 float average luminance, 4 KB, which drives the auto exposure; without
+  // it the CPU sees a stale value and the picture is far too bright), not the 1280x720 targets
+  // whose readback stalls every frame.
+  {
+    const int32_t max_bytes = REXCVAR_GET(readback_resolve_max_bytes);
+    if (max_bytes > 0 && written_length > uint32_t(max_bytes)) {
+      return true;
+    }
+    // readback_resolve_formato: only resolves to this destination format (-1 = any). Each
+    // readback in "full" mode waits for the GPU, and FH2 has ~40 small resolves a frame (the
+    // reflection cube mips) - 97 ms of waiting; the luminance is the only k_32_FLOAT one.
+    const int32_t only_format = REXCVAR_GET(readback_resolve_formato);
+    if (only_format >= 0 &&
+        uint32_t(register_file_->Get<reg::RB_COPY_DEST_INFO>().copy_dest_format) !=
+            uint32_t(only_format)) {
+      return true;
+    }
   }
 
   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
@@ -5391,6 +5532,71 @@ void VulkanCommandProcessor::DisableHostOcclusionQueries() {
   active_occlusion_query_ = {};
   occlusion_query_cursor_ = 0;
   occlusion_query_resources_available_ = false;
+  occlusion_queries_pending_.clear();
+  occlusion_query_last_samples_.clear();
+}
+
+void VulkanCommandProcessor::CollectCompletedOcclusionQueries() {
+  const uint64_t completed = GetCompletedSubmission();
+  bool any_completed = false;
+  for (const PendingOcclusionQuery& query : occlusion_queries_pending_) {
+    if (query.submission <= completed) {
+      any_completed = true;
+      break;
+    }
+  }
+  if (!any_completed) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  if (!(vulkan_device->memory_types().host_coherent &
+        (uint32_t(1) << occlusion_query_readback_memory_type_))) {
+    VkMappedMemoryRange memory_range = {};
+    memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    memory_range.memory = occlusion_query_readback_memory_;
+    memory_range.offset = 0;
+    memory_range.size =
+        std::min(rex::round_up(VkDeviceSize(sizeof(uint64_t) * kMaxOcclusionQueries),
+                               vulkan_device->properties().nonCoherentAtomSize),
+                 occlusion_query_readback_memory_size_);
+    vulkan_device->functions().vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1,
+                                                              &memory_range);
+  }
+  const uint64_t* results = reinterpret_cast<const uint64_t*>(occlusion_query_readback_mapping_);
+  auto kept = occlusion_queries_pending_.begin();
+  for (const PendingOcclusionQuery& query : occlusion_queries_pending_) {
+    if (query.submission <= completed) {
+      occlusion_query_last_samples_[query.sample_count_address] =
+          NormalizeOcclusionSamples(results[query.host_index]);
+    } else {
+      *kept++ = query;
+    }
+  }
+  occlusion_queries_pending_.erase(kept, occlusion_queries_pending_.end());
+}
+
+bool VulkanCommandProcessor::AreDebugLabelsEnabled() const { return REXCVAR_GET(gpu_rotulos); }
+
+bool VulkanCommandProcessor::AreUploadsHoisted() const {
+  return REXCVAR_GET(gpu_uploads_antecipados);
+}
+
+DeferredCommandBuffer& VulkanCommandProcessor::upload_command_buffer() {
+  assert_true(submission_open_);
+  if (!upload_command_buffer_used_) {
+    upload_command_buffer_used_ = true;
+    // Everything earlier on the queue (other submissions' reads and GPU writes of the shared memory) before the
+    // copies.
+    VkMemoryBarrier barrier;
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.pNext = nullptr;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    upload_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
+                                                nullptr, 0, nullptr);
+  }
+  return upload_command_buffer_;
 }
 
 bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_address) {
@@ -5446,6 +5652,23 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
                                            occlusion_query_readback_buffer_,
                                            sizeof(uint64_t) * host_index, sizeof(uint64_t),
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+  if (REXCVAR_GET(occlusion_query_assincrono)) {
+    // No sync: the copy lands in the readback buffer when this submission runs; the game gets the last result
+    // of this query now (a game reads its queries frames later anyway - lens flares, light visibility).
+    occlusion_queries_pending_.push_back({sample_count_address, host_index, GetCurrentSubmission()});
+    CollectCompletedOcclusionQueries();
+    auto last = occlusion_query_last_samples_.find(sample_count_address);
+    uint64_t samples;
+    if (last != occlusion_query_last_samples_.end()) {
+      samples = last->second;
+    } else {
+      int32_t fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
+      samples = uint64_t(fake_sample_count < 0 ? 1000 : fake_sample_count);
+    }
+    WriteGuestOcclusionResult(sample_count_address, samples);
+    return true;
+  }
 
   if (!EndSubmission(false)) {
     return false;
@@ -5709,6 +5932,11 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    upload_command_buffer_.Reset();
+    upload_command_buffer_used_ = false;
+    if (shared_memory_) {
+      shared_memory_->ResetSubmissionTouched();
+    }
     CronometroInicioSubmissao();
 
     // Reset cached state of the command buffer.
@@ -5942,6 +6170,11 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       sparse_memory_binds_.clear();
     }
 
+    // The app in the background (iOS): Metal would refuse this command buffer and the device would be lost.
+    // Hold it - and with it the game, which waits for the GPU - until the app is active again.
+    while (rex_app_background.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     SubmitBarriers(true);
     CronometroFimSubmissao();
 
@@ -5959,6 +6192,18 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     if (dfn.vkBeginCommandBuffer(command_buffer.buffer, &command_buffer_begin_info) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
+    }
+    if (upload_command_buffer_used_) {
+      // The uploads moved to the start, then the submission's commands, which see them.
+      VkMemoryBarrier barrier;
+      barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+      barrier.pNext = nullptr;
+      barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+      upload_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0,
+                                                  nullptr, 0, nullptr);
+      upload_command_buffer_.Execute(command_buffer.buffer);
     }
     deferred_command_buffer_.Execute(command_buffer.buffer);
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {

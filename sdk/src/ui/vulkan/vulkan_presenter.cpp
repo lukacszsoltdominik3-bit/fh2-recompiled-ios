@@ -359,6 +359,14 @@ REXCVAR_DEFINE_BOOL(present_refresco_sellado_perezoso, false, "UI/Presenter",
                     "apagado). Apagado vuelve al envio por fotograma")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+
+// True while the app may not use the GPU: on iOS from applicationWillResignActive until the app is active again
+// (set from SDL's lifecycle events, windowed_app_context_sdl.cpp). Metal refuses command buffers from a
+// background app ("Insufficient Permission", MTLCommandBufferError 7), which MoltenVK reports as a lost device -
+// the game crashed when the phone was locked or another app opened. The presenter skips painting and the GPU
+// command processor holds its submissions (and so the game) meanwhile.
+extern "C" __attribute__((visibility("default"))) std::atomic<bool> rex_app_background{false};
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -2572,6 +2580,9 @@ void VulkanPresenter::RegistrarSuperficieDesactualizada(const char* llamada, VkR
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  if (rex_app_background.load(std::memory_order_acquire)) {
+    return PaintResult::kNotPresented;
+  }
   // present_hdr switched: recreate the swapchain in the other format through the reconnection. Where
   // the surface offers no HDR, nothing changes.
   if (REXCVAR_GET(present_hdr) != paint_context_.swapchain_hdr &&

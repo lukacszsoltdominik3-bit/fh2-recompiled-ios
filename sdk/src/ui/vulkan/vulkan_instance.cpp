@@ -42,16 +42,16 @@ REXCVAR_DEFINE_STRING(android_tmp_dir, "", "UI/Vulkan", "Android custom loader t
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
 
-#if REX_PLATFORM_SWITCH
-// NVK for Horizon is linked statically (Mesa's libvulkan.a) and exports the
-// entry points directly. api.h defines VK_NO_PROTOTYPES, so they have to be
-// declared by hand.
+#if REX_PLATFORM_SWITCH || REX_PLATFORM_IOS
+// Static Vulkan (NVK on Horizon, APPLE_STATIC_LOADER on iOS) exports the entry
+// points directly. api.h defines VK_NO_PROTOTYPES, so they have to be declared
+// by hand.
 extern "C" {
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* pName);
 VKAPI_ATTR void VKAPI_CALL vkDestroyInstance(VkInstance instance,
                                              const VkAllocationCallbacks* pAllocator);
 }
-#endif  // REX_PLATFORM_SWITCH
+#endif  // REX_PLATFORM_SWITCH || REX_PLATFORM_IOS
 
 namespace rex {
 namespace ui {
@@ -71,7 +71,14 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 
   bool functions_loaded = true;
   bool loader_loaded = false;
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_IOS
+  // iOS: static Vulkan loader + static MoltenVK are linked into the executable
+  // (no unsigned dylibs allowed at runtime). Take the entry functions directly
+  // like Switch instead of dlopen.
+  ifn.vkGetInstanceProcAddr = &::vkGetInstanceProcAddr;
+  ifn.vkDestroyInstance = &::vkDestroyInstance;
+  loader_loaded = true;
+#elif REX_PLATFORM_MAC
   const MacOSVulkanRuntimePaths macos_runtime_paths = DetectMacOSVulkanRuntimePaths();
   ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
 
@@ -124,13 +131,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   }
 #endif
 
-#if !REX_PLATFORM_SWITCH
+#if !REX_PLATFORM_SWITCH && !REX_PLATFORM_IOS
 #define XE_VULKAN_LOAD_LOADER_FUNCTION(name) \
   functions_loaded &= (ifn.name = vulkan_instance->loader_.GetSymbol<PFN_##name>(#name)) != nullptr;
   XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
   XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
 #undef XE_VULKAN_LOAD_LOADER_FUNCTION
-#endif  // !REX_PLATFORM_SWITCH
+#endif  // !REX_PLATFORM_SWITCH && !REX_PLATFORM_IOS
   if (!functions_loaded) {
     REXLOG_ERROR("Failed to get Vulkan loader function pointers");
     return nullptr;

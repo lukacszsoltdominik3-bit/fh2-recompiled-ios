@@ -294,9 +294,9 @@ add_subdirectory(src/audio)
 add_subdirectory(src/graphics)
 add_subdirectory(src/system)
 add_subdirectory(src/kernel)
-if(NOT REXGLUE_PLATFORM_SWITCH AND NOT ANDROID)
-    # Host tools. Code generation runs on the PC; a Switch build compiles its
-    # output.
+if(NOT REXGLUE_PLATFORM_SWITCH AND NOT ANDROID AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # Host tools. Code generation runs on the PC; a cross-compile target
+    # (Switch, Android, iOS) compiles its output.
     add_subdirectory(src/codegen)
     add_subdirectory(src/rexglue)
 endif()
@@ -327,6 +327,8 @@ message(STATUS "===========================================")
 # SDK install/export rules (skipped when consumed as a subdirectory)
 if(PROJECT_IS_TOP_LEVEL AND ANDROID)
     message(STATUS "Skipping desktop SDK install/export rules for the Android cross-build")
+elseif(PROJECT_IS_TOP_LEVEL AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    message(STATUS "Skipping desktop SDK install/export rules for the iOS cross-build")
 elseif(PROJECT_IS_TOP_LEVEL)
     include(cmake/rexglue_devenv.cmake)
     include(cmake/rexglue_install.cmake)

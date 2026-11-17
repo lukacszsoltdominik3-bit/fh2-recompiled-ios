@@ -128,6 +128,15 @@ bool ReXApp::SetupEnvironment() {
   if (!game_data_cvar.empty()) {
     game_dir = game_data_cvar;
   }
+#if REX_PLATFORM_IOS
+  // iOS gives no CLI args; default to Documents/game_root, which the user can
+  // populate via the Files app (UIFileSharingEnabled + LSSupportsOpeningDocumentsInPlace).
+  if (game_dir.empty()) {
+    game_dir = rex::filesystem::GetUserFolder() / "game_root";
+    std::error_code ec;
+    std::filesystem::create_directories(game_dir, ec);
+  }
+#endif
 
   // User data: cvar override, or platform user directory
   std::filesystem::path user_dir;
@@ -160,8 +169,17 @@ bool ReXApp::SetupEnvironment() {
     metadata_dir = metadata_root_cvar;
   }
 
+  // On iOS the exe lives in a read-only bundle; keep the config file next to
+  // the game and logs in the sandbox Documents dir so the user can edit it
+  // via the Files app.
+#if REX_PLATFORM_IOS
+  std::filesystem::path config_file_dir = user_dir;
+#else
+  std::filesystem::path config_file_dir = exe_dir;
+#endif
   PathConfig path_config{game_dir,  user_dir,     update_dir,
-                         cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
+                         cache_dir, metadata_dir,
+                         config_file_dir / (std::string(GetName()) + ".toml")};
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
@@ -186,9 +204,9 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-#if REX_PLATFORM_ANDROID
-    // The executable lives under /system/bin on Android; log files belong
-    // under the app's writable user-data directory instead.
+#if REX_PLATFORM_ANDROID || REX_PLATFORM_IOS
+    // The executable lives inside a read-only app bundle on Android/iOS; log
+    // files belong under the app's writable user-data directory instead.
     log_config.log_dir = (user_dir / "logs").string();
 #else
     log_config.log_dir = (exe_dir / "logs").string();

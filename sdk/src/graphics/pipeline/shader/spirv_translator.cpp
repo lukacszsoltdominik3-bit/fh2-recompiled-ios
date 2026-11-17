@@ -25,6 +25,14 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+#include <rex/cvar.h>
+
+#include <cstdio>
+
+REXCVAR_DEFINE_STRING(gpu_limitar_lacos, "", "GPU",
+                      "Cap the guest loop iteration count in shaders: \"<shader hash hex>:<max>\" "
+                      "(comma-separated) - for a costly guest loop the host GPU can't finish")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::graphics {
 
@@ -681,21 +689,31 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     // not hitting any switch case and reaching the final break in the body).
     function_main_->addBlock(main_loop_continue_);
     builder_->setBuildPoint(main_loop_continue_);
+    // In the rectangle guest-vertex loop, the block that restarts the guest program for the next
+    // guest vertex (pc = 0) is emitted below, after this OpPhi is created, so its incoming edge is
+    // appended to the OpPhi later through this pointer. Without it the OpPhi lacked that
+    // predecessor (invalid SPIR-V); SPIRV-Cross (MoltenVK) then kept the last jump target as the
+    // program counter, so guest vertices 1 and 2 of every rectangle skipped the start of the
+    // shader (position fetch) and rectangle lists drawn by vertex shaders with jumps vanished.
+    spv::Instruction* main_loop_pc_next_phi = nullptr;
     if (has_main_switch) {
       // OpPhi, if added, must be the first in the block.
       // If labels were added, but not jumps (for example, due to the call
       // instruction not being implemented as of October 18, 2020), send an
       // impossible program counter value (-1) to the OpPhi at the next
       // iteration.
-      if (main_switch_next_pc_phi_operands_.empty()) {
+      if (main_switch_next_pc_phi_operands_.empty() && !rectangle_vertex_loop) {
         main_switch_next_pc_phi_operands_.push_back(builder_->makeIntConstant(-1));
       }
       std::unique_ptr<spv::Instruction> main_loop_pc_next_op = std::make_unique<spv::Instruction>(
           main_loop_pc_next_, type_int_,
-          main_switch_next_pc_phi_operands_.size() >= 2 ? spv::OpPhi : spv::OpCopyObject);
+          (main_switch_next_pc_phi_operands_.size() >= 2 || rectangle_vertex_loop)
+              ? spv::OpPhi
+              : spv::OpCopyObject);
       for (spv::Id operand : main_switch_next_pc_phi_operands_) {
         main_loop_pc_next_op->addIdOperand(operand);
       }
+      main_loop_pc_next_phi = main_loop_pc_next_op.get();
       builder_->getBuildPoint()->addInstruction(std::move(main_loop_pc_next_op));
     }
     builder_->createBranch(main_loop_header_);
@@ -936,8 +954,11 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
         }
 
         if (has_main_switch) {
-          main_switch_next_pc_phi_operands_.push_back(const_int_0_);
-          main_switch_next_pc_phi_operands_.push_back(builder_->getBuildPoint()->getId());
+          // Restart the guest program at pc 0 for the next guest vertex (see where the OpPhi is
+          // created - it already exists, so the edge is appended to it directly).
+          assert_not_null(main_loop_pc_next_phi);
+          main_loop_pc_next_phi->addIdOperand(const_int_0_);
+          main_loop_pc_next_phi->addIdOperand(builder_->getBuildPoint()->getId());
         }
         builder_->createBranch(main_loop_continue_);
       }
@@ -1362,6 +1383,35 @@ void SpirvShaderTranslator::ProcessLoopStartInstruction(const ParsedLoopStartIns
   spv::Id loop_count_stack_old = builder_->createLoad(var_main_loop_count_, spv::NoPrecision);
   spv::Id loop_count_new = builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_, loop_constant,
                                                  const_int_0_, const_int_8);
+  // gpu_limitar_lacos: "<shader hash>:<max>[,...]" caps the iteration count of every guest loop
+  // in that shader (a costly guest loop the host GPU can't finish in time).
+  {
+    static const std::vector<std::pair<uint64_t, uint32_t>> loop_caps = [] {
+      std::vector<std::pair<uint64_t, uint32_t>> caps;
+      const std::string list = REXCVAR_GET(gpu_limitar_lacos);
+      size_t pos = 0;
+      while (pos < list.size()) {
+        size_t end = list.find(',', pos);
+        if (end == std::string::npos) end = list.size();
+        unsigned long long hash = 0;
+        unsigned max_count = 0;
+        if (std::sscanf(list.substr(pos, end - pos).c_str(), "%llx:%u", &hash, &max_count) == 2 &&
+            hash && max_count) {
+          caps.emplace_back(hash, max_count);
+        }
+        pos = end + 1;
+      }
+      return caps;
+    }();
+    for (const auto& cap : loop_caps) {
+      if (current_shader().ucode_data_hash() == cap.first) {
+        loop_count_new = builder_->createBinBuiltinCall(type_uint_, ext_inst_glsl_std_450_,
+                                                        GLSLstd450UMin, loop_count_new,
+                                                        builder_->makeUintConstant(cap.second));
+        break;
+      }
+    }
+  }
   id_vector_temp_.clear();
   id_vector_temp_.push_back(loop_count_new);
   for (unsigned int i = 0; i < 3; ++i) {

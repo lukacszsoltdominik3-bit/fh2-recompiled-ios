@@ -4,6 +4,7 @@ set(REXSYSTEM_SOURCES
     achievement_manager.cpp
     achievements.cpp
     kernel_state.cpp
+    static_module_registry.cpp
     xmemory.cpp
     kernel_module.cpp
     user_module.cpp
@@ -48,9 +49,9 @@ set(REXSYSTEM_SOURCES
     xex_module.cpp
 )
 
-if(REXGLUE_PLATFORM_SWITCH)
+if(REXGLUE_PLATFORM_SWITCH OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     # A NRO is a single static executable: no shared libraries, no dlopen.
-    # rexglue_switch_configure_target links it whole into the title.
+    # iOS apps are a single signed Mach-O: ship rexruntime whole-linked.
     add_library(rexruntime STATIC ${REXSYSTEM_SOURCES})
 else()
     add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})

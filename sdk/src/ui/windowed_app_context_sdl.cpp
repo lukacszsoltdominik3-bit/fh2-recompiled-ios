@@ -23,6 +23,10 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/window_sdl.h>
 
+#include <atomic>
+
+extern "C" std::atomic<bool> rex_app_background;  // src/ui/vulkan/vulkan_presenter.cpp
+
 namespace rex::ui {
 
 SDLWindowedAppContext::~SDLWindowedAppContext() {
@@ -41,10 +45,17 @@ bool SDLWindowedAppContext::Initialize() {
   // Picked before SDL_InitSubSystem, long before a graphics instance can say
   // which surface extensions it has, so the cvar is the escape hatch.
   std::string requested_driver = REXCVAR_GET(video_driver);
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
   // macOS presents via a CAMetalLayer surface obtained from the Cocoa driver.
   if (requested_driver.empty()) {
     requested_driver = "cocoa";
+  }
+#endif
+#if REX_PLATFORM_IOS
+  // iOS has only the UIKit driver (no Cocoa); SDL3 picks it automatically,
+  // but set it explicitly in case the shared macOS code path leaked "cocoa".
+  if (requested_driver.empty() || requested_driver == "cocoa") {
+    requested_driver = "uikit";
   }
 #endif
   if (!requested_driver.empty()) {
@@ -205,6 +216,18 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
 
 bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event) {
   auto* context = static_cast<SDLWindowedAppContext*>(userdata);
+#if REX_PLATFORM_IOS
+  // Delivered synchronously from the UIApplication delegate: WILL_ENTER_BACKGROUND is
+  // applicationWillResignActive, DID_ENTER_FOREGROUND is applicationDidBecomeActive. No GPU work in between
+  // (rex_app_background, src/ui/vulkan/vulkan_presenter.cpp).
+  if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+    rex_app_background.store(true, std::memory_order_release);
+    REXLOG_INFO("[ios] app inativo: GPU em pausa");
+  } else if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+    rex_app_background.store(false, std::memory_order_release);
+    REXLOG_INFO("[ios] app ativo: GPU retomada");
+  }
+#endif
   if (event->type == SDL_EVENT_QUIT && SDL_IsMainThread() && context->IsInUIThread()) {
     // Cocoa stops making Metal drawables available as part of its termination
     // request. Handle the request synchronously while SDL is queueing it,

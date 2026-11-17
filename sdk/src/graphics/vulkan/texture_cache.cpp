@@ -1692,6 +1692,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       if (!RexSwitchPerfSkip(8))
 #endif
       command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
+      if (command_processor_.AreDebugLabelsEnabled()) {
+        command_buffer.CmdVkInsertDebugLabel(
+            fmt::format("{} f{} {}x{}x{} @{:08X} L{}", "TLOAD", uint32_t(guest_format), width, height,
+                        depth_or_array_size, texture_key.base_page << 12, level)
+                .c_str());
+      }
       load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
       load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
     }
@@ -1796,6 +1802,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 #endif
         command_buffer.CmdVkDispatch(group_count_x, group_count_y,
                                      load_constants_float_convert.size_blocks[2]);
+        if (command_processor_.AreDebugLabelsEnabled()) {
+        command_buffer.CmdVkInsertDebugLabel(
+            fmt::format("{} f{} {}x{}x{} @{:08X} L{}", "TFLOAT", uint32_t(guest_format), width, height,
+                        depth_or_array_size, texture_key.base_page << 12, level)
+                .c_str());
+      }
+
         load_constants_float_convert.guest_offset += level_array_slice_stride_bytes;
         load_constants_float_convert.host_offset += level_array_slice_stride_bytes;
       }
@@ -1826,11 +1839,25 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         texture_dst_access_mask, texture_old_layout, texture_new_layout);
   }
   command_processor_.SubmitBarriers(true);
+#if defined(__APPLE__)
+  // MoltenVK: a single buffer->3D-image copy with depth > 1 and a padded
+  // bufferImageHeight leaves the slices past z=0 empty on Apple GPUs (FH2's
+  // color-grading LUT then reads black and the tonemapped world goes black).
+  // Copy 3D textures one depth slice per region instead.
+  const bool copy_per_slice = is_3d;
+#else
+  const bool copy_per_slice = false;
+#endif
+  uint32_t copy_region_count = 0;
+  for (uint32_t level = level_first; level <= level_last; ++level) {
+    copy_region_count += copy_per_slice ? std::max(depth >> level, UINT32_C(1)) : 1;
+  }
   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
       scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-      level_last - level_first + 1);
+      copy_region_count);
+  uint32_t copy_region_index = 0;
   for (uint32_t level = level_first; level <= level_last; ++level) {
-    VkBufferImageCopy& copy_region = copy_regions[level - level_first];
+    VkBufferImageCopy& copy_region = copy_regions[copy_region_index++];
     const HostLayout& level_host_layout =
         level != 0 ? host_layout_mips[std::min(level, level_packed)] : host_layout_base;
     copy_region.bufferOffset = level_host_layout.offset_bytes;
@@ -1866,6 +1893,27 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     copy_region.imageExtent.height =
         std::max((height * texture_resolution_scale_y) >> level, UINT32_C(1));
     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
+    if (copy_per_slice && copy_region.imageExtent.depth > 1) {
+      const uint32_t slice_count = copy_region.imageExtent.depth;
+      const VkDeviceSize slice_stride_bytes =
+          VkDeviceSize(load_shader_info.bytes_per_host_block) * level_host_layout.x_pitch_blocks *
+          level_host_layout.y_pitch_blocks;
+      copy_region.imageExtent.depth = 1;
+      const VkBufferImageCopy slice0 = copy_region;
+      for (uint32_t z = 1; z < slice_count; ++z) {
+        VkBufferImageCopy& slice_region = copy_regions[copy_region_index++];
+        slice_region = slice0;
+        slice_region.bufferOffset += slice_stride_bytes * z;
+        slice_region.imageOffset.z = int32_t(z);
+      }
+    }
+  }
+  assert_true(copy_region_index == copy_region_count);
+  if (command_processor_.AreDebugLabelsEnabled()) {
+    command_buffer.CmdVkInsertDebugLabel(
+        fmt::format("TCOPY f{} {}x{}x{} @{:08X} r{}", uint32_t(guest_format), width, height,
+                    depth_or_array_size, texture_key.base_page << 12, copy_region_count)
+            .c_str());
   }
 
   if (atalho_kind == 2) {

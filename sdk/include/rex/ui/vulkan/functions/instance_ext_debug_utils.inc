@@ -2,3 +2,4 @@
 XE_UI_VULKAN_FUNCTION(vkCreateDebugUtilsMessengerEXT)
 XE_UI_VULKAN_FUNCTION(vkDestroyDebugUtilsMessengerEXT)
 XE_UI_VULKAN_FUNCTION(vkSetDebugUtilsObjectNameEXT)
+XE_UI_VULKAN_FUNCTION(vkCmdInsertDebugUtilsLabelEXT)

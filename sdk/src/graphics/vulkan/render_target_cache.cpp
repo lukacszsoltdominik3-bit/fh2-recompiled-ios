@@ -1457,6 +1457,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                         sizeof(atalho_constants), &atalho_constants);
       command_processor_.SubmitBarriers(true);
       command_buffer.CmdVkDispatch((atalho.host_width + 7) / 8, (atalho.host_height + 7) / 8, 1);
+      if (command_processor_.AreDebugLabelsEnabled()) {
+        command_buffer.CmdVkInsertDebugLabel("RTC atalho");
+      }
       // The packed texels into the shortcut image.
       command_processor_.PushBufferMemoryBarrier(
           atalho_buffer.buffer(), 0, VK_WHOLE_SIZE, atalho_buffer.SetStageMask(VK_PIPELINE_STAGE_TRANSFER_BIT),
@@ -1619,6 +1622,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           if (!RexSwitchPerfSkip(4))
 #endif
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+          if (command_processor_.AreDebugLabelsEnabled()) {
+            command_buffer.CmdVkInsertDebugLabel("RTC resolve copy");
+          }
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
@@ -1690,6 +1696,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           if (!RexSwitchPerfSkip(4))
 #endif
           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+          if (command_processor_.AreDebugLabelsEnabled()) {
+            command_buffer.CmdVkInsertDebugLabel("RTC resolve clear");
+          }
         }
         if (clear_color) {
           command_processor_.BindExternalComputePipeline(
@@ -1713,6 +1722,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           if (!RexSwitchPerfSkip(4))
 #endif
           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+          if (command_processor_.AreDebugLabelsEnabled()) {
+            command_buffer.CmdVkInsertDebugLabel("RTC resolve clear");
+          }
         }
         MarkEdramBufferModified();
         cleared = true;
@@ -5023,6 +5035,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         if (!RexSwitchPerfSkip(2))
 #endif
         command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
+        if (command_processor_.AreDebugLabelsEnabled()) {
+          command_buffer.CmdVkInsertDebugLabel("RTC host depth store");
+        }
         MarkEdramBufferModified();
       }
     }
@@ -5649,6 +5664,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             if (!RexSwitchPerfSkip(2))
 #endif
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
+            if (command_processor_.AreDebugLabelsEnabled()) {
+              command_buffer.CmdVkInsertDebugLabel("RTC transfer draw");
+            }
             g_cp_times.transfer_draws.fetch_add(1, std::memory_order_relaxed);
           }
         }
@@ -6570,6 +6588,13 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
            (kDumpSamplesPerGroupY - 1)) /
               kDumpSamplesPerGroupY,
           1);
+      if (command_processor_.AreDebugLabelsEnabled()) {
+        command_buffer.CmdVkInsertDebugLabel(
+            fmt::format("RTC dump fmt{} 64bpp{} msaa{} {}x{} tiles",
+                        uint32_t(rt_key.resource_format), uint32_t(rt_key.Is64bpp()),
+                        uint32_t(rt_key.msaa_samples), dispatch.width_tiles, dispatch.height_tiles)
+                .c_str());
+      }
     }
     MarkEdramBufferModified();
   }

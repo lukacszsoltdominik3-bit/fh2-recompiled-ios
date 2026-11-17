@@ -95,7 +95,14 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Pages read or written by GPU commands recorded in the current submission (every RequestRanges and
+  // RangeWrittenByGpu since the last reset; the command processor resets it when a submission begins). An upload
+  // of pages none of those commands touched can run at the start of the submission instead of in place: no
+  // earlier command sees different data (gpu_uploads_antecipados, vulkan/shared_memory.cpp).
+  void ResetSubmissionTouched();
+
  protected:
+  bool AnySubmissionTouched(uint32_t page_first, uint32_t page_count) const;
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
   void InitializeCommon();
@@ -175,6 +182,9 @@ class SharedMemory {
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;
+  // Command processor thread only (RequestRanges, RangeWrittenByGpu, uploads): see ResetSubmissionTouched.
+  std::vector<uint64_t> submission_touched_;
+  void MarkSubmissionTouched(uint32_t start, uint32_t length);
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);

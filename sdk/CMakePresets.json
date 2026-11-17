@@ -139,6 +139,37 @@
             "displayName": "macOS ARM64",
             "description": "Multi-config build for macOS ARM64 using Clang",
             "inherits": "mac-arm64-base"
+        },
+        {
+            "name": "ios-arm64",
+            "displayName": "iOS ARM64 (device)",
+            "description": "iOS on-device build (iphoneos SDK, Xcode generator)",
+            "generator": "Xcode",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_TOOLCHAIN_FILE": {
+                    "value": "${sourceDir}/toolchains/ios.cmake",
+                    "type": "FILEPATH"
+                },
+                "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+                "REXGLUE_ENABLE_TRACY": "OFF",
+                "REXGLUE_BUILD_TESTS": "OFF"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        },
+        {
+            "name": "ios-sim-arm64",
+            "displayName": "iOS ARM64 (simulator)",
+            "description": "iOS Simulator build (iphonesimulator SDK, Xcode generator)",
+            "inherits": "ios-arm64",
+            "cacheVariables": {
+                "CMAKE_OSX_SYSROOT": "iphonesimulator"
+            }
         }
     ],
     "buildPresets": [

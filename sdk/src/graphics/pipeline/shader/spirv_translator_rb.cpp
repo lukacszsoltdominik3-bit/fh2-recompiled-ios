@@ -20,6 +20,19 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/math.h>
+#include <rex/cvar.h>
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+
+REXCVAR_DEFINE_STRING(gpu_teste_ps_saida, "", "GPU",
+                      "Debug: replace color output 0 of one pixel shader with a diagnostic of "
+                      "one input value. \"<ps hash hex>:<i|r><index>.<x|y|z|w>\" (i = "
+                      "interpolator as received, r = register at the end of the shader). Output: "
+                      "R = 0.25 if the shader ran, 1 if the value is NaN; G = 1 if infinite, 0.5 "
+                      "if negative; B = |value| / 16 clamped (finite values only)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::graphics {
 
@@ -395,6 +408,81 @@ spv::Id SpirvShaderTranslator::Depth20e4To32(SpirvBuilder& builder, spv::Id f24_
 }
 
 void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+  // gpu_teste_ps_saida: diagnostic output for one pixel shader (see the cvar).
+  {
+    struct DiagnosticSpec {
+      unsigned long long hash = 0;
+      char kind = 0;
+      unsigned index = 0;
+      uint32_t component = 0;
+      bool valid = false;
+    };
+    static const DiagnosticSpec spec = [] {
+      DiagnosticSpec s;
+      const std::string text = REXCVAR_GET(gpu_teste_ps_saida);
+      char component = 0;
+      if (std::sscanf(text.c_str(), "%llx:%c%u.%c", &s.hash, &s.kind, &s.index, &component) == 4 &&
+          (s.kind == 'i' || s.kind == 'r') && std::strchr("xyzw", component) && component) {
+        s.component = uint32_t(std::strchr("xyzw", component) - "xyzw");
+        s.valid = true;
+      }
+      return s;
+    }();
+    if (spec.valid && current_shader().ucode_data_hash() == spec.hash &&
+        !edram_fragment_shader_interlock_ &&
+        output_or_var_fragment_data_[0] != spv::NoResult) {
+      spv::Id source = spv::NoResult;
+      if (spec.kind == 'i' && spec.index < xenos::kMaxInterpolators &&
+          input_output_interpolators_[spec.index] != spv::NoResult) {
+        source = builder_->createLoad(input_output_interpolators_[spec.index], spv::NoPrecision);
+      } else if (spec.kind == 'r' && spec.index < register_count()) {
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(builder_->makeIntConstant(int(spec.index)));
+        source = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+      }
+      spv::Id diag_r, diag_g, diag_b;
+      if (source != spv::NoResult) {
+        spv::Id value = builder_->createCompositeExtract(source, type_float_, spec.component);
+        spv::Id is_nan = builder_->createUnaryOp(spv::OpIsNan, type_bool_, value);
+        spv::Id is_inf = builder_->createUnaryOp(spv::OpIsInf, type_bool_, value);
+        spv::Id is_negative =
+            builder_->createBinOp(spv::OpFOrdLessThan, type_bool_, value, const_float_0_);
+        spv::Id is_finite = builder_->createUnaryOp(
+            spv::OpLogicalNot, type_bool_,
+            builder_->createBinOp(spv::OpLogicalOr, type_bool_, is_nan, is_inf));
+        diag_r = builder_->createTriOp(spv::OpSelect, type_float_, is_nan, const_float_1_,
+                                       builder_->makeFloatConstant(0.25f));
+        diag_g = builder_->createTriOp(
+            spv::OpSelect, type_float_, is_inf, const_float_1_,
+            builder_->createTriOp(spv::OpSelect, type_float_, is_negative,
+                                  builder_->makeFloatConstant(0.5f), const_float_0_));
+        spv::Id magnitude = builder_->createBinBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450FMin,
+            builder_->createBinOp(
+                spv::OpFMul, type_float_,
+                builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                 GLSLstd450FAbs, value),
+                builder_->makeFloatConstant(1.0f / 16.0f)),
+            const_float_1_);
+        diag_b = builder_->createTriOp(spv::OpSelect, type_float_, is_finite, magnitude,
+                                       const_float_0_);
+      } else {
+        // The requested value does not exist in this shader: grey.
+        diag_r = diag_g = diag_b = builder_->makeFloatConstant(0.5f);
+      }
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(diag_r);
+      id_vector_temp_.push_back(diag_g);
+      id_vector_temp_.push_back(diag_b);
+      id_vector_temp_.push_back(const_float_1_);
+      builder_->createStore(builder_->createCompositeConstruct(type_float4_, id_vector_temp_),
+                            output_or_var_fragment_data_[0]);
+    }
+  }
+
   // Loaded if needed.
   spv::Id msaa_samples = spv::NoResult;
 

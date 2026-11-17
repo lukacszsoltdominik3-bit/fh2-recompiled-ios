@@ -27,6 +27,10 @@
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#elif defined(__APPLE__)
+// Darwin's futex: os_sync_wait_on_address (iOS 17.4 / macOS 14.4). Before these the waits below
+// were plain sleeps on Apple and the wakes did nothing.
+#include <os/os_sync_wait_on_address.h>
 #endif
 
 #include <rex/cvar.h>
@@ -118,8 +122,27 @@ REXCVAR_DEFINE_INT32(gpu_msaa_muestras, 4, "GPU",
 // app finds them with dlsym; adapted from NFSMW-Recompiled-Mobile (tools/parche_espera_anillo.py).
 extern "C" __attribute__((visibility("default"))) std::atomic<uint32_t> rex_cp_rptr_seq{0};
 extern "C" __attribute__((visibility("default"))) std::atomic<uint32_t> rex_cp_rptr_waiters{0};
+// Size of the primary ring in 32-bit words (a power of two; 0 until the game sets the ring up): the ring-room
+// hook waits for a share of it to be consumed instead of waking at every publication.
+extern "C" __attribute__((visibility("default"))) std::atomic<uint32_t> rex_cp_ring_words{0};
 
 namespace {
+#if defined(__APPLE__)
+// Darwin's futex (os_sync_*, iOS 17.4 / macOS 14.4) checked once: __builtin_available calls the OS version
+// check every time, and these run thousands of times a frame (a profile on the iPhone: ~6 % of the game's
+// render thread in __isPlatformVersionAtLeast and libxpc).
+// (The os_sync calls below are guarded by HasOsSync, which the compiler cannot see.)
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+bool HasOsSync() {
+  static const bool has = [] {
+    if (__builtin_available(iOS 17.4, macOS 14.4, *)) {
+      return true;
+    }
+    return false;
+  }();
+  return has;
+}
+#endif
 // After each write of the read pointer copy: bumps the sequence and wakes the sleepers, with a system call
 // only when someone sleeps.
 void PublishReadPointer() {
@@ -127,6 +150,12 @@ void PublishReadPointer() {
 #if defined(__linux__)
   if (rex_cp_rptr_waiters.load(std::memory_order_seq_cst)) {
     syscall(SYS_futex, &rex_cp_rptr_seq, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+  }
+#elif defined(__APPLE__)
+  if (rex_cp_rptr_waiters.load(std::memory_order_seq_cst)) {
+    if (HasOsSync()) {
+      os_sync_wake_by_address_all(&rex_cp_rptr_seq, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+    }
   }
 #endif
 }
@@ -149,6 +178,10 @@ std::atomic<uint32_t> swap_seq{0};
 void FutexWake(std::atomic<uint32_t>& word) {
 #if defined(__linux__)
   syscall(SYS_futex, reinterpret_cast<uint32_t*>(&word), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+#elif defined(__APPLE__)
+  if (HasOsSync()) {
+    os_sync_wake_by_address_all(&word, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+  }
 #endif
 }
 
@@ -156,6 +189,16 @@ void FutexWait(std::atomic<uint32_t>& word, uint32_t expected, int64_t nanosecon
 #if defined(__linux__)
   timespec limit{time_t(nanoseconds / 1000000000), long(nanoseconds % 1000000000)};
   syscall(SYS_futex, reinterpret_cast<uint32_t*>(&word), FUTEX_WAIT_PRIVATE, expected, &limit, nullptr, 0);
+#elif defined(__APPLE__)
+  if (HasOsSync()) {
+    if (nanoseconds > 0) {
+      os_sync_wait_on_address_with_timeout(&word, expected, sizeof(uint32_t),
+                                           OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME,
+                                           uint64_t(nanoseconds));
+    }
+  } else {
+    rex::thread::Sleep(std::chrono::nanoseconds(nanoseconds));
+  }
 #else
   (void)word;
   (void)expected;
@@ -433,6 +476,7 @@ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
   read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+  rex_cp_ring_words.store(primary_buffer_size_ / uint32_t(sizeof(uint32_t)), std::memory_order_relaxed);
 }
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {

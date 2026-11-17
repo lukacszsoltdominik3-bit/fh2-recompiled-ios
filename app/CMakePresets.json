@@ -183,6 +183,36 @@
             "displayName": "macOS ARM64 RelWithDebInfo",
             "inherits": "mac-arm64-base",
             "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+        },
+        {
+            "name": "ios-arm64",
+            "displayName": "iOS ARM64 (device)",
+            "generator": "Xcode",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_TOOLCHAIN_FILE": {
+                    "value": "${sourceDir}/../sdk/toolchains/ios.cmake",
+                    "type": "FILEPATH"
+                },
+                "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
+                "REXSDK_DIR": {
+                    "value": "${sourceDir}/../sdk",
+                    "type": "PATH"
+                }
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        },
+        {
+            "name": "ios-sim-arm64",
+            "inherits": "ios-arm64",
+            "displayName": "iOS ARM64 (simulator)",
+            "cacheVariables": {
+                "CMAKE_OSX_SYSROOT": "iphonesimulator"
+            }
         }
     ],
     "buildPresets": [

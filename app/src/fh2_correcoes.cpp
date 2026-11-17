@@ -122,3 +122,22 @@ REX_HOOK_RAW(sub_82ECEB88) {
   }
   ctx.r3.u64 = 1;
 }
+
+// XMediaFacade (XMediaFacade_default.xex): `sub_88062000` is a one-line setter
+// `*(this+12) = 0;`. A null-this call writes guest 0x0C → SIGSEGV on iOS.
+// It returns void, so the null case is a harmless no-op. Kept as a belt-and-
+// braces guard; the real iOS fault (main recomp's no-op register save/restore
+// helpers shadowing the module's working ones under static link) is fixed in
+// sdk/cmake/rexglue_helpers.cmake by renaming the helpers per module.
+REX_EXTERN(__imp__sub_88062000);
+REX_HOOK_RAW(sub_88062000) {
+  if (ctx.r3.u32 < 0x10000) {
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
+      REXLOG_WARN("[fh2] sub_88062000 (XMediaFacade): null this from {:08X}: no-op",
+                  static_cast<uint32_t>(ctx.lr));
+    }
+    return;
+  }
+  __imp__sub_88062000(ctx, base);
+}

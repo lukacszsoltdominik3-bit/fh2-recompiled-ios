@@ -54,11 +54,12 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
 
 }  // namespace
 
-#if REX_PLATFORM_SWITCH
+#if REX_PLATFORM_SWITCH || REX_PLATFORM_IOS
 }  // namespace rex::system
 
-// A NRO cannot load code at run time: rexgpu-xenos is linked into the
-// executable, and its plugin_main.cpp entry points are called directly.
+// Switch (NRO) / iOS (no unsigned dylibs) cannot load code at run time:
+// rexgpu-xenos is linked into the executable, and its plugin_main.cpp entry
+// points are called directly.
 extern "C" uint32_t rex_gpu_abi_version(void);
 extern "C" rex::system::IGraphicsSystem* rex_gpu_create(uint32_t abi_version,
                                                          const rex::system::GpuCreateInfo* info);
@@ -149,6 +150,6 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
   return std::unique_ptr<IGraphicsSystem>(graphics_system);
 }
 
-#endif  // REX_PLATFORM_SWITCH
+#endif  // REX_PLATFORM_SWITCH || REX_PLATFORM_IOS
 
 }  // namespace rex::system

@@ -58,6 +58,12 @@ class VulkanSharedMemory : public SharedMemory {
  private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
                      VkAccessFlags& access_mask) const;
+  // In place (ending the render pass, ordered with the commands around it) or, hoisted, in the command
+  // processor's upload command buffer at the start of the submission.
+  bool UploadPageRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges,
+                        bool hoisted);
+  std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_hoisted_;
+  std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_in_place_;
 
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;

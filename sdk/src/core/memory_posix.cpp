@@ -9,6 +9,8 @@
  * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
  */
 
+#include <rex/platform.h>
+
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -23,8 +25,11 @@
 
 #if REX_PLATFORM_MAC
 #include <mach/mach.h>
+#if !REX_PLATFORM_IOS
 #include <mach/mach_vm.h>
+#endif
 #include <mach/vm_region.h>
+#include <mach/vm_map.h>
 #endif  // REX_PLATFORM_MAC
 
 #include <sys/mman.h>
@@ -34,7 +39,6 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/utils.h>
-#include <rex/platform.h>
 #include <rex/string.h>
 
 // macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
@@ -130,9 +134,17 @@ uint32_t ToPosixProtectFlags(PageAccess access) {
     case PageAccess::kReadWrite:
       return PROT_READ | PROT_WRITE;
     case PageAccess::kExecuteReadOnly:
+#if REX_PLATFORM_IOS
+      return PROT_READ;
+#else
       return PROT_READ | PROT_EXEC;
+#endif
     case PageAccess::kExecuteReadWrite:
+#if REX_PLATFORM_IOS
+      return PROT_READ | PROT_WRITE;
+#else
       return PROT_READ | PROT_WRITE | PROT_EXEC;
+#endif
     default:
       assert_unhandled_case(access);
       return PROT_NONE;
@@ -142,7 +154,8 @@ uint32_t ToPosixProtectFlags(PageAccess access) {
 bool IsWritableExecutableMemorySupported() {
 #if REX_PLATFORM_MAC
   // macOS enforces W^X on Apple Silicon. Shared file mappings cannot be both
-  // writable and executable. The code cache must use separate RW and RX views.
+  // writable and executable. iOS forbids PROT_EXEC on anonymous pages without
+  // the dynamic-codesigning entitlement; the recomp is AOT, so neither needs it.
   return false;
 #else
   return true;
@@ -358,9 +371,11 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 
   int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #if REX_PLATFORM_MAC
+#if !REX_PLATFORM_IOS
   if (access == PageAccess::kExecuteReadWrite || access == PageAccess::kExecuteReadOnly) {
     flags |= MAP_JIT;
   }
+#endif
   if (base_address) {
     flags |= MAP_FIXED;
   }
@@ -478,6 +493,31 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 #if REX_PLATFORM_MAC
+#if REX_PLATFORM_IOS
+  // iOS SDK does not expose mach_vm.h; vm_region_64 covers the same case here
+  // because the guest reservation sits well below the 4 GiB addressable limit.
+  vm_address_t address = reinterpret_cast<vm_address_t>(base_address);
+  vm_size_t region_size = 0;
+  vm_region_basic_info_data_64_t info;
+  mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object_name = MACH_PORT_NULL;
+
+  kern_return_t kr =
+      vm_region_64(mach_task_self(), &address, &region_size, VM_REGION_BASIC_INFO_64,
+                   reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
+  if (MACH_PORT_VALID(object_name)) {
+    mach_port_deallocate(mach_task_self(), object_name);
+  }
+  if (kr != KERN_SUCCESS) {
+    return false;
+  }
+  if (address > reinterpret_cast<vm_address_t>(base_address)) {
+    return false;
+  }
+
+  length = static_cast<size_t>((address + region_size) -
+                               reinterpret_cast<vm_address_t>(base_address));
+#else
   mach_vm_address_t address = reinterpret_cast<mach_vm_address_t>(base_address);
   mach_vm_size_t region_size = 0;
   vm_region_basic_info_data_64_t info;
@@ -496,6 +536,7 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 
   length = static_cast<size_t>((address + region_size) -
                                reinterpret_cast<mach_vm_address_t>(base_address));
+#endif
 
   if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) ==
       (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) {
@@ -582,6 +623,24 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
       return kFileMappingHandleInvalid;
   }
   oflag |= O_CREAT;
+#if REX_PLATFORM_IOS
+  (void)oflag;
+  // POSIX named shared memory (shm_open) isn't allowed inside the iOS app
+  // sandbox. Use a private temporary file in TMPDIR and unlink it immediately
+  // so the fd owns its lifetime, even if the process crashes.
+  const char* tmpdir = std::getenv("TMPDIR");
+  std::string file_template = std::string(tmpdir ? tmpdir : "/tmp") + "/fh2-guest-memory-XXXXXX";
+  int ret = mkstemp(file_template.data());
+  if (ret < 0) {
+    return kFileMappingHandleInvalid;
+  }
+  unlink(file_template.c_str());
+  if (rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
+    close(ret);
+    return kFileMappingHandleInvalid;
+  }
+  return static_cast<FileMappingHandle>(ret);
+#else
   auto full_path = MakeShmName(path);
   int ret = shm_open(full_path.c_str(), oflag, 0777);
   if (ret < 0) {
@@ -598,6 +657,7 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   // the next run died with SIGBUS.
   shm_unlink(full_path.c_str());
   return static_cast<FileMappingHandle>(ret);
+#endif
 #endif
 }
 

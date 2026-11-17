@@ -23,6 +23,11 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <memory>
 
 #include <pthread.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#include <cstdlib>
+#include <string>
+#endif
 #include <semaphore.h>
 
 #if defined(__APPLE__)
@@ -720,7 +725,31 @@ class PosixCondition<Thread> : public PosixConditionBase {
       pthread_attr_destroy(&attr);
       return false;
     }
+#if defined(__APPLE__)
+    // Apple: an explicit SCHED_FIFO priority opts the thread out of QoS, and with it out of
+    // the scheduler's placement on performance cores and of precise timers (a vblank timer
+    // thread oversleeping by 2-3 ms). Run every emulator / guest thread at the interactive QoS.
+    // Off by default: measured on an iPhone, giving every guest / emulator thread the
+    // interactive QoS starved MoltenVK's and Metal's own threads (16.9 fps, a 27 ms GPU wait a
+    // frame, against 21 fps). A file Documents/fh2/qos starting with '1' turns it on for tests.
+    static const bool use_qos = [] {
+      bool enabled = false;
+      if (const char* home = std::getenv("HOME")) {
+        std::string path = std::string(home) + "/Documents/fh2/qos";
+        if (FILE* file = std::fopen(path.c_str(), "rb")) {
+          enabled = std::fgetc(file) == '1';
+          std::fclose(file);
+        }
+      }
+      return enabled;
+    }();
+    if (use_qos) {
+      pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+    if (!use_qos && params.initial_priority != 0) {
+#else
     if (params.initial_priority != 0) {
+#endif
       sched_param sched{};
       sched.sched_priority = params.initial_priority + 1;
       if (pthread_attr_setschedpolicy(&attr, SCHED_FIFO) != 0) {
@@ -903,6 +932,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_priority(int new_priority) {
     WaitStarted();
+#if defined(__APPLE__)
+    // Threads keep their QoS class (see Initialize); SCHED_FIFO would opt them out of it.
+    (void)new_priority;
+    return;
+#endif
     sched_param param{};
     param.sched_priority = new_priority;
     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);

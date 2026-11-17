@@ -20,6 +20,13 @@
 
 #include <sys/uio.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <mach/mach.h>
+#if !TARGET_OS_IOS
+#include <mach/mach_vm.h>
+#endif
+#endif
 
 REXCVAR_DEFINE_BOOL(fh2_censo, false, "FH2",
                     "Debug: count calls into the game's D3D library and log them every 150 frames");
@@ -672,8 +679,28 @@ CensoEntry g_entries[kEntries] = {
 bool ReadGuest(uint8_t* base, uint32_t address, uint32_t& value) {
   if (address < 0x10000 || address >= 0xFFFF0000u) return false;
   uint32_t raw;
+#if defined(__APPLE__) && !TARGET_OS_IOS
+  mach_vm_size_t got = 0;
+  if (mach_vm_read_overwrite(mach_task_self(),
+                             reinterpret_cast<mach_vm_address_t>(base + address), 4,
+                             reinterpret_cast<mach_vm_address_t>(&raw), &got) != KERN_SUCCESS ||
+      got != 4) {
+    return false;
+  }
+#elif defined(__APPLE__) && TARGET_OS_IOS
+  // iOS SDK does not expose mach_vm_*. vm_read_overwrite covers the <4GiB
+  // guest reservation; the vm_size_t pointer types match on this path.
+  vm_size_t got = 0;
+  if (vm_read_overwrite(mach_task_self(),
+                        reinterpret_cast<vm_address_t>(base + address), 4,
+                        reinterpret_cast<vm_address_t>(&raw), &got) != KERN_SUCCESS ||
+      got != 4) {
+    return false;
+  }
+#else
   iovec local{&raw, 4}, remote{base + address, 4};
   if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 4) return false;
+#endif
   value = __builtin_bswap32(raw);
   return true;
 }

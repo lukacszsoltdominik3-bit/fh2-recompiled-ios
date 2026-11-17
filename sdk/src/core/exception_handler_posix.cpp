@@ -20,6 +20,9 @@
 #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 
 #include <signal.h>
+#include <fcntl.h>
+#include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 
 #include <cstdint>
@@ -31,6 +34,10 @@
 #include <rex/platform.h>
 
 #include <ucontext.h>
+#if REX_PLATFORM_MAC
+#include <execinfo.h>
+#include <rex/thread.h>
+#endif
 
 namespace rex::arch {
 
@@ -418,13 +425,35 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
-#if REX_PLATFORM_ANDROID
+#if REX_PLATFORM_ANDROID || REX_PLATFORM_MAC
   // Nobody handled this fault. Returning with our handler still installed
   // retries the same instruction forever (black screen and a log storm).
-  // Restore Android/ART's previous handler; the repeated synchronous fault
-  // then follows the normal crash path, including debuggerd's tombstone.
+  // Restore the previous handler; the repeated synchronous fault then follows
+  // the normal crash path (debuggerd's tombstone on Android, a crash report
+  // with the faulting pc on macOS/iOS).
+#if REX_PLATFORM_MAC && REX_ARCH_ARM64
+  // Record the fault in our own log first: on iOS the crash report lives
+  // outside the app sandbox and cannot be pulled over devicectl, but the
+  // app's log file can. Not async-signal-safe, but the process dies next.
+  {
+    void* frames[48];
+    const int depth = backtrace(frames, 48);
+    REXLOG_ERROR("Unhandled host fault: signal {} addr 0x{:016X} pc 0x{:016X} lr 0x{:016X} sp 0x{:016X} thread 0x{:X}",
+                 signal_number, reinterpret_cast<uintptr_t>(signal_info->si_addr),
+                 uintptr_t(thread_context.pc), uintptr_t(thread_context.x[30]),
+                 uintptr_t(thread_context.sp), rex::thread::current_thread_id());
+    char** symbols = backtrace_symbols(frames, depth);
+    for (int i = 0; i < depth; ++i) {
+      REXLOG_ERROR("  bt[{:02}] {}", i, symbols ? symbols[i] : "?");
+    }
+  }
+#endif
   const struct sigaction* original = signal_number == SIGILL
-      ? &original_sigill_handler_ : &original_sigsegv_handler_;
+      ? &original_sigill_handler_
+#if REX_PLATFORM_MAC
+      : signal_number == SIGBUS ? &original_sigbus_handler_
+#endif
+      : &original_sigsegv_handler_;
   struct sigaction fallback = *original;
   if (fallback.sa_handler == SIG_IGN) fallback.sa_handler = SIG_DFL;
   if (sigaction(signal_number, &fallback, nullptr) != 0) {
@@ -432,6 +461,42 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   }
 #endif
 }
+
+#if REX_PLATFORM_MAC
+// SIGTRAP (brk: hardened-libc++ assertion, __builtin_trap) and SIGABRT never
+// reach the access-violation path above. Log a backtrace into the app's own
+// log (pullable from the iOS sandbox), then die through the default action.
+static char g_fatal_log_path[1024] = {0};
+static void FatalSignalLogger(int signal_number, siginfo_t* info, void* uctx) {
+  // Async-signal-safe: raw write() + backtrace_symbols_fd into a file in the
+  // app sandbox (Documents/fh2/crash.txt), pullable over devicectl.
+  int fd = g_fatal_log_path[0] ? open(g_fatal_log_path, O_WRONLY | O_CREAT | O_APPEND, 0644) : 2;
+  char buf[160];
+  uintptr_t pc = 0, lr = 0;
+#if REX_ARCH_ARM64
+  if (uctx) {
+    auto* mc = static_cast<ucontext_t*>(uctx)->uc_mcontext;
+#if __DARWIN_OPAQUE_ARM_THREAD_STATE64
+    pc = reinterpret_cast<uintptr_t>(mc->__ss.__opaque_pc);
+    lr = reinterpret_cast<uintptr_t>(mc->__ss.__opaque_lr);
+#else
+    pc = mc->__ss.__pc;
+    lr = mc->__ss.__lr;
+#endif
+  }
+#endif
+  int len = snprintf(buf, sizeof(buf), "=== fatal signal %d addr %p pc 0x%lx lr 0x%lx ===\n",
+                     signal_number, info ? info->si_addr : nullptr, (unsigned long)pc,
+                     (unsigned long)lr);
+  if (len > 0) write(fd, buf, size_t(len));
+  void* frames[64];
+  const int depth = backtrace(frames, 64);
+  backtrace_symbols_fd(frames, depth, fd);
+  if (fd != 2) close(fd);
+  signal(signal_number, SIG_DFL);
+  raise(signal_number);
+}
+#endif
 
 void ExceptionHandler::Install(Handler fn, void* data) {
   if (!signal_handlers_installed_) {
@@ -448,6 +513,17 @@ void ExceptionHandler::Install(Handler fn, void* data) {
       assert_always("Failed to install new SIGSEGV handler");
     }
 #if REX_PLATFORM_MAC
+    {
+      struct sigaction fatal_handler;
+      std::memset(&fatal_handler, 0, sizeof(fatal_handler));
+      if (const char* home = getenv("HOME")) {
+        snprintf(g_fatal_log_path, sizeof(g_fatal_log_path), "%s/Documents/fh2/crash.txt", home);
+      }
+      fatal_handler.sa_sigaction = FatalSignalLogger;
+      fatal_handler.sa_flags = SA_SIGINFO | SA_RESETHAND;
+      sigaction(SIGTRAP, &fatal_handler, nullptr);
+      sigaction(SIGABRT, &fatal_handler, nullptr);
+    }
     if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
       assert_always("Failed to install new SIGBUS handler");
     }

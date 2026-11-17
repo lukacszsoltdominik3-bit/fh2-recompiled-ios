@@ -123,12 +123,13 @@ function(rexglue_configure_target target_name)
             COMMAND_EXPAND_LISTS
             VERBATIM
         )
-    elseif(APPLE)
+    elseif(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         # macOS: $<TARGET_RUNTIME_DLLS> does not resolve imported dylibs, so
         # stage the shared runtime libraries explicitly next to the executable
         # (paired with the @executable_path rpath above). Everything else the
         # runtime links (fmt, spdlog, SDL3, ...) is static. Target names
         # differ between an in-tree build and an installed SDK import.
+        # iOS: everything is already static-linked into the .app, no staging.
         foreach(_rexglue_runtime_lib rex::runtime rexruntime rex::TracyClient TracyClient)
             if(TARGET ${_rexglue_runtime_lib})
                 add_custom_command(TARGET ${target_name} POST_BUILD
@@ -158,35 +159,73 @@ function(rexglue_configure_target target_name)
 
     # Stage requested GPU emulation plugins next to the executable. Plugins
     # are runtime-loaded (never linked), so TARGET_RUNTIME_DLLS misses them.
-    foreach(_plugin IN LISTS ARG_GPU_PLUGINS)
-        if(TARGET rexgpu-${_plugin})
-            # In-tree build: depend on it so it gets built.
-            set(_plugin_target rexgpu-${_plugin})
-            add_dependencies(${target_name} ${_plugin_target})
-        elseif(TARGET rex::gpu-${_plugin})
-            # Installed SDK import.
-            set(_plugin_target rex::gpu-${_plugin})
-        else()
-            message(FATAL_ERROR
-                "rexglue_configure_target: unknown GPU plugin '${_plugin}' "
-                "(no target rexgpu-${_plugin} or rex::gpu-${_plugin})")
+    # iOS: plugins are statically linked into the app binary (see gpu_plugin_loader
+    # fallback to rex_gpu_create), so skip the colocation copy.
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        foreach(_plugin IN LISTS ARG_GPU_PLUGINS)
+            if(TARGET rexgpu-${_plugin})
+                # In-tree build: depend on it so it gets built.
+                set(_plugin_target rexgpu-${_plugin})
+                add_dependencies(${target_name} ${_plugin_target})
+            elseif(TARGET rex::gpu-${_plugin})
+                # Installed SDK import.
+                set(_plugin_target rex::gpu-${_plugin})
+            else()
+                message(FATAL_ERROR
+                    "rexglue_configure_target: unknown GPU plugin '${_plugin}' "
+                    "(no target rexgpu-${_plugin} or rex::gpu-${_plugin})")
+            endif()
+            # A target of its own, not a POST_BUILD step of the executable: POST_BUILD only runs when
+            # the executable relinks, so a rebuilt plugin was left stale next to it.
+            add_custom_target(${target_name}_stage_gpu_${_plugin} ALL
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:${_plugin_target}>
+                    $<TARGET_FILE_DIR:${target_name}>
+                VERBATIM
+            )
+            if(TARGET rexgpu-${_plugin})
+                add_dependencies(${target_name}_stage_gpu_${_plugin} rexgpu-${_plugin})
+            endif()
+            add_dependencies(${target_name}_stage_gpu_${_plugin} ${target_name})
+            unset(_plugin_target)
+        endforeach()
+    else()
+        # iOS: no runtime loading of signed dylibs, so the GPU plugin is linked
+        # statically into the host. Force-load so its plugin_main.cpp
+        # (rex_gpu_abi_version / rex_gpu_create exports) is pulled into the
+        # final executable; the static-linked branch in gpu_plugin_loader.cpp
+        # calls those entry points directly.
+        foreach(_plugin IN LISTS ARG_GPU_PLUGINS)
+            if(TARGET rexgpu-${_plugin})
+                add_dependencies(${target_name} rexgpu-${_plugin})
+                target_link_options(${target_name} PRIVATE
+                    "LINKER:-force_load,$<TARGET_FILE:rexgpu-${_plugin}>")
+                target_link_libraries(${target_name} PRIVATE rexgpu-${_plugin})
+            endif()
+        endforeach()
+        # Static Vulkan loader + MoltenVK + Metal/IOSurface frameworks.
+        # vulkan_instance.cpp on iOS takes vkGetInstanceProcAddr / vkDestroyInstance
+        # directly, which must resolve at link time. MoltenVK provides them; the
+        # loader's trampoline.o has them too but conflicts with MoltenVK's copy.
+        # Link MoltenVK (force_load so static ctors + Objective-C categories fire),
+        # add Metal / IOSurface / QuartzCore frameworks MoltenVK needs, skip the
+        # Vulkan loader on iOS so we don't double-define the entries.
+        if(TARGET MoltenVK)
+            add_dependencies(${target_name} MoltenVK)
+            target_link_options(${target_name} PRIVATE
+                "LINKER:-force_load,$<TARGET_FILE:MoltenVK>")
+            target_link_libraries(${target_name} PRIVATE MoltenVK)
         endif()
-        # A target of its own, not a POST_BUILD step of the executable: POST_BUILD only runs when
-        # the executable relinks, so a rebuilt plugin was left stale next to it.
-        add_custom_target(${target_name}_stage_gpu_${_plugin} ALL
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                $<TARGET_FILE:${_plugin_target}>
-                $<TARGET_FILE_DIR:${target_name}>
-            VERBATIM
-        )
-        if(TARGET rexgpu-${_plugin})
-            add_dependencies(${target_name}_stage_gpu_${_plugin} rexgpu-${_plugin})
-        endif()
-        add_dependencies(${target_name}_stage_gpu_${_plugin} ${target_name})
-        unset(_plugin_target)
-    endforeach()
+        target_link_libraries(${target_name} PRIVATE
+            "-framework Metal"
+            "-framework IOSurface"
+            "-framework QuartzCore"
+            "-framework Foundation"
+            "-framework CoreGraphics"
+            "-framework UIKit")
+    endif()
 
-    if(APPLE AND REXGLUE_USE_VULKAN)
+    if(APPLE AND REXGLUE_USE_VULKAN AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         _rexglue_stage_macos_vulkan_runtime(${target_name})
     endif()
 endfunction()
@@ -203,7 +242,95 @@ endfunction()
 function(rexglue_configure_module_target target_name)
     cmake_parse_arguments(ARG "" "HOST" "" ${ARGN})
 
-    if(ARG_HOST)
+    if(ARG_HOST AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        # iOS: no unsigned shared libraries, so we cannot ship module .dylibs.
+        # Convert the module library to STATIC, rename its C-level
+        # ReXModule_Register / ReXModule_GetImageInfo to a per-module name to
+        # avoid link-time collisions with sibling modules, emit a tiny .cpp
+        # that registers the renamed symbols with the static-module table at
+        # static init, and link the whole thing into the host.
+        # The module is already declared STATIC on iOS (see dll_targets.cmake).
+        string(MAKE_C_IDENTIFIER "${target_name}" _rxmod_sym)
+        set(_rxmod_adaptor
+            "${CMAKE_CURRENT_BINARY_DIR}/${target_name}_static_register.cpp")
+        file(WRITE "${_rxmod_adaptor}" "// Auto-generated — do not edit.\n"
+            "// iOS static module adaptor for ${target_name}.\n"
+            "#include <rex/system/static_module_registry.h>\n"
+            "#include <rex/image_info.h>\n"
+            "#include <rex/system/function_dispatcher.h>\n\n"
+            "extern \"C\" void ${_rxmod_sym}_ReXModule_Register(rex::runtime::IModuleRegistrar*);\n"
+            "extern \"C\" const rex::PPCImageInfo* ${_rxmod_sym}_ReXModule_GetImageInfo();\n\n"
+            "namespace {\n"
+            "struct Registrar {\n"
+            "  Registrar() {\n"
+            "    rex::system::RegisterStaticModule(\n"
+            "        \"${target_name}\",\n"
+            "        rex::system::StaticModuleEntry{&${_rxmod_sym}_ReXModule_Register,\n"
+            "                                      &${_rxmod_sym}_ReXModule_GetImageInfo});\n"
+            "  }\n"
+            "};\n"
+            "Registrar g_registrar;\n"
+            "}  // namespace\n")
+        target_sources(${target_name} PRIVATE "${_rxmod_adaptor}")
+        # Adaptor needs plain C++, not the module's PCH (fh2_pch.h).
+        set_source_files_properties("${_rxmod_adaptor}" PROPERTIES
+            SKIP_PRECOMPILE_HEADERS ON)
+        target_compile_definitions(${target_name} PRIVATE
+            "ReXModule_Register=${_rxmod_sym}_ReXModule_Register"
+            "ReXModule_GetImageInfo=${_rxmod_sym}_ReXModule_GetImageInfo"
+            # The module's per-image global data would otherwise collide with
+            # the main recomp's identically-named globals (one strong def per
+            # TU; all static-linked together on iOS). Rename per module.
+            "PPCImageConfig=${_rxmod_sym}_PPCImageConfig"
+            "PPCFuncMappings=${_rxmod_sym}_PPCFuncMappings"
+        )
+        # Prepend an override of DEFINE_REX_FUNC that makes `__imp__<name>`
+        # weak, so the PPC helper definitions (`__savevmx_14`, ...) that the
+        # codegen emits into every module do not collide on static link.
+        # Thread it through target_precompile_headers so the extra include is
+        # part of the PCH itself — adding it as -include on sources instead
+        # produces a PCH-flag-hash mismatch and the PCH fails to load.
+        target_precompile_headers(${target_name} PRIVATE
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../include/rex/ios_module_weak.h")
+        # The PPC register save/restore helpers (__savegprlr_NN etc.) must stay
+        # private to each module: the main recomp is generated with
+        # REX_CONFIG_NON_VOLATILE_AS_LOCAL so its copies are no-ops, while the
+        # module's copies really touch ctx.rNN. Rename them per module so the
+        # static link can't let main's no-op shadow the module's working one.
+        set(_rxmod_rename "${CMAKE_CURRENT_BINARY_DIR}/${target_name}_rename_helpers.h")
+        # `xstart` is the codegen's name for every image's entry point: without
+        # this the main exe's strong xstart wins and the module's DllMain jumps
+        # into the game's own entry (re-runs title init, blocks forever).
+        set(_rxmod_rename_body "// Auto-generated per-module PPC helper renames.\n#pragma once\n#define xstart ${_rxmod_sym}_xstart\n")
+        foreach(_k gprlr fpr vmx)
+            foreach(_n RANGE 14 31)
+                string(APPEND _rxmod_rename_body
+                    "#define __save${_k}_${_n} ${_rxmod_sym}___save${_k}_${_n}\n"
+                    "#define __rest${_k}_${_n} ${_rxmod_sym}___rest${_k}_${_n}\n")
+            endforeach()
+        endforeach()
+        foreach(_n RANGE 64 127)
+            string(APPEND _rxmod_rename_body
+                "#define __savevmx_${_n} ${_rxmod_sym}___savevmx_${_n}\n"
+                "#define __restvmx_${_n} ${_rxmod_sym}___restvmx_${_n}\n")
+        endforeach()
+        file(WRITE "${_rxmod_rename}" "${_rxmod_rename_body}")
+        target_precompile_headers(${target_name} PRIVATE "${_rxmod_rename}")
+        # The host target may be declared after this call (dll_targets.cmake is
+        # included before add_executable). Defer link_options and link_libraries
+        # so they are applied once the host target exists.
+        cmake_language(EVAL CODE
+            "cmake_language(DEFER CALL target_link_options ${ARG_HOST} PRIVATE
+                \"LINKER:-force_load,$<TARGET_FILE:${target_name}>\")")
+        cmake_language(EVAL CODE
+            "cmake_language(DEFER CALL target_link_libraries ${ARG_HOST} PRIVATE ${target_name})")
+        set_target_properties(${target_name} PROPERTIES
+            XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO"
+            XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY ""
+        )
+        cmake_language(EVAL CODE
+            "cmake_language(DEFER CALL add_dependencies ${ARG_HOST} ${target_name})")
+    elseif(ARG_HOST)
         set_target_properties(${target_name} PROPERTIES
             LIBRARY_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:${ARG_HOST}>
             RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:${ARG_HOST}>

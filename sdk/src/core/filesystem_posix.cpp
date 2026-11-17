@@ -27,6 +27,7 @@
 #include <rex/assert.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/platform/env.h>
 #include <rex/string.h>
 
@@ -151,6 +152,14 @@ std::filesystem::path GetUserFolder() {
   // to the NRO, as in the portable PC version.
   auto exe_dir = GetExecutableFolder();
   return exe_dir.empty() ? std::filesystem::path("/switch") : exe_dir;
+#elif REX_PLATFORM_IOS
+  // On iOS the sandbox home is in HOME; its Documents subdir is what the Files
+  // app shows the user, so put save data, logs, shader cache and the config
+  // file there instead of the hidden .local/share path.
+  if (auto home = rex::platform::env::get("HOME")) {
+    return std::filesystem::path(*home) / "Documents";
+  }
+  return std::filesystem::path("/tmp");
 #else
   // get preferred data home
   if (auto xdg = rex::platform::env::get("XDG_DATA_HOME")) {

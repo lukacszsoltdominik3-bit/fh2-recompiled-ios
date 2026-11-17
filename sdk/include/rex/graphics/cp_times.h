@@ -43,6 +43,12 @@ struct CpTimes {
   // Ownership transfers between render targets: calls with transfers or clears, and transfer draws.
   std::atomic<uint32_t> transfer_calls{0};
   std::atomic<uint32_t> transfer_draws{0};
+  // Render passes ended (each one a tile store + load on a mobile GPU, and a new Metal encoder in MoltenVK), and
+  // shared memory uploads (guest memory the CPU wrote, copied for the GPU: each one ends the render pass).
+  std::atomic<uint32_t> render_passes_ended{0};
+  std::atomic<uint32_t> shm_uploads{0};
+  std::atomic<uint32_t> shm_uploads_hoisted{0};  // gpu_uploads_antecipados: moved to the start of the submission
+  std::atomic<uint64_t> shm_upload_bytes{0};
 };
 
 extern CpTimes g_cp_times;

@@ -24,9 +24,9 @@ add_library(rexcore OBJECT
 )
 add_library(rex::core ALIAS rexcore)
 
-if(ANDROID)
-    # Bionic omits makecontext/swapcontext. The AAPCS64 backend is shared with
-    # Switch, but does not depend on libnx.
+if(ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # Bionic omits makecontext/swapcontext, and iOS's are stubs that fail. The
+    # AAPCS64 backend is shared with Switch, but does not depend on libnx.
     target_sources(rexcore PRIVATE fiber_switch.cpp)
 endif()
 

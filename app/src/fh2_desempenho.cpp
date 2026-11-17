@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <rex/platform.h>
 #include <chrono>
 #include <cstdint>
 
@@ -30,6 +31,8 @@
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#elif defined(__APPLE__)
+#include <os/os_sync_wait_on_address.h>
 #endif
 
 #include <rex/cvar.h>
@@ -114,8 +117,94 @@ bool IsRingWait(uint32_t return_address) {
 
 }  // namespace
 
+#if REX_PLATFORM_IOS
+extern "C" std::atomic<uint32_t> rex_cp_rptr_seq;
+extern "C" std::atomic<uint32_t> rex_cp_rptr_waiters;
+extern "C" std::atomic<uint32_t> rex_cp_ring_words;
+
+// The os_sync calls are guarded by kHasOsSync, which the compiler cannot see.
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+
+namespace {
+
+// Darwin's futex (iOS 17.4) checked once: __builtin_available runs the OS version check on every call, and this
+// hook ran hundreds of thousands of times a second (iPhone profile: ~6 % of the render thread).
+const bool kHasOsSync = [] {
+  if (__builtin_available(iOS 17.4, *)) {
+    return true;
+  }
+  return false;
+}();
+
+// One wait for room, per thread: the wait state the game passed (r3) and the time base it stored there when the
+// wait began (state + 20, sub_82B72998), and the read pointer from which the current share is counted.
+struct RingWait {
+  uint32_t state = 0;
+  uint32_t started = 0;
+  uint32_t from = 0;
+};
+thread_local RingWait t_ring_wait;
+
+}  // namespace
+#endif
+
 REX_HOOK_RAW(sub_82B72A90) {
-#if defined(__linux__)
+#if REX_PLATFORM_IOS
+  // iOS (GPU plugin linked statically): sleep on the CP's read pointer sequence with Darwin's
+  // futex instead of spinning. Without it the game's render thread spun a core whenever the ring
+  // was full, which (with the rest) put the phone in serious thermal state on the slow cores.
+  //
+  // The CP publishes its read pointer every 32+ words, so waking at each publication (as before) woke this
+  // thread thousands of times a frame - in effect it still spun (iPhone profile: half of the render thread's
+  // time, much of it on a performance core the CP and MoltenVK's queue thread were left without). Now it
+  // sleeps until an eighth of the ring has been consumed since the wait (or its previous share) began, at most
+  // 2 ms per turn. The ring is full while the game waits here, so the CP still has seven eighths of it queued:
+  // it never runs dry, and the game writes in larger pieces. If the CP stops publishing for half a millisecond
+  // (it ran out of commands, or is in a long packet) the turn ends, so a wait for a nearly drained ring returns
+  // as soon as before.
+  if (kHasOsSync && REXCVAR_GET(fh2_espera_anel) && IsRingWait(static_cast<uint32_t>(ctx.lr))) {
+    const uint32_t state = ctx.r3.u32;
+    const uint32_t device = LoadGuestU32(base, state + 0);
+    const uint32_t read_pointer_copy = LoadGuestU32(base, device + kDeviceReadPointerCopy);
+    const uint32_t started = LoadGuestU32(base, state + 20);
+    RingWait& wait = t_ring_wait;
+    if (wait.state != state || wait.started != started) {
+      wait.state = state;
+      wait.started = started;
+      wait.from = LoadGuestU32(base, state + 8);  // the read pointer when the wait began
+    }
+    const uint32_t ring_words = rex_cp_ring_words.load(std::memory_order_relaxed);
+    const uint32_t mask = ring_words ? ring_words - 1 : 0xFFFFFFFFu;
+    // Without the ring size (not set up yet): any movement, as before.
+    const uint32_t share = ring_words ? std::max<uint32_t>(ring_words / 8, 0x100u) : 1;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+    uint32_t read_pointer = LoadGuestU32(base, read_pointer_copy);
+    rex_cp_rptr_waiters.fetch_add(1, std::memory_order_seq_cst);
+    for (;;) {
+      // Sequence first, pointer second: a publication in between changes the sequence and the wait returns.
+      const uint32_t before = rex_cp_rptr_seq.load(std::memory_order_seq_cst);
+      read_pointer = LoadGuestU32(base, read_pointer_copy);
+      if (((read_pointer - wait.from) & mask) >= share) {
+        break;
+      }
+      const auto left = deadline - std::chrono::steady_clock::now();
+      if (left <= std::chrono::nanoseconds(0)) {
+        break;
+      }
+      const int64_t slice = std::min<int64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(left).count(), 500000);  // 0.5 ms
+      os_sync_wait_on_address_with_timeout(&rex_cp_rptr_seq, before, sizeof(uint32_t),
+                                           OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME,
+                                           uint64_t(slice));
+      if (rex_cp_rptr_seq.load(std::memory_order_seq_cst) == before) {
+        break;  // nothing published in that slice
+      }
+    }
+    rex_cp_rptr_waiters.fetch_sub(1, std::memory_order_seq_cst);
+    // If the game still lacks room, its next turn waits for the next share.
+    wait.from = read_pointer;
+  }
+#elif defined(__linux__)
   if (REXCVAR_GET(fh2_espera_anel) && IsRingWait(static_cast<uint32_t>(ctx.lr))) {
     if (const ReadPointerSignal* signal = Signal()) {
       // Sequence first, pointer second: if the CP publishes in between, the sequence has already changed and

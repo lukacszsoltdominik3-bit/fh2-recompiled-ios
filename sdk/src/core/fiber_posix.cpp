@@ -17,7 +17,7 @@
 #endif
 
 #include <rex/platform.h>
-#if (REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID) || REX_PLATFORM_MAC
+#if (REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID) || (REX_PLATFORM_MAC && !REX_PLATFORM_IOS)
 
 #include <rex/thread/fiber.h>
 

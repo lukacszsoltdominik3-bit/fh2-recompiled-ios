@@ -29,7 +29,7 @@
 
 #include <rex/platform.h>
 
-#if REX_PLATFORM_SWITCH || (REX_PLATFORM_ANDROID && REX_ARCH_ARM64)
+#if REX_PLATFORM_SWITCH || (REX_PLATFORM_ANDROID && REX_ARCH_ARM64) || (REX_PLATFORM_IOS && REX_ARCH_ARM64)
 
 #include <rex/thread/fiber.h>
 
@@ -72,12 +72,23 @@ void rex_fiber_entry(void);
 // rex_fiber_trampoline is declared in fiber.h, so it can be a friend of Fiber.
 }
 
+#if defined(__APPLE__)
+// Mach-O: C symbols carry a leading underscore, no .type/.size directives.
+#define REX_FIBER_SYM(name) "_" #name
+#define REX_FIBER_TYPE(name) ""
+#define REX_FIBER_SIZE(name) ""
+#else
+#define REX_FIBER_SYM(name) #name
+#define REX_FIBER_TYPE(name) ".type " #name ", %function\n"
+#define REX_FIBER_SIZE(name) ".size " #name ", .-" #name "\n"
+#endif
+
 __asm__(
     ".text\n"
     ".balign 4\n"
-    ".global rex_fiber_swap\n"
-    ".type rex_fiber_swap, %function\n"
-    "rex_fiber_swap:\n"
+    ".global " REX_FIBER_SYM(rex_fiber_swap) "\n"
+    REX_FIBER_TYPE(rex_fiber_swap)
+    REX_FIBER_SYM(rex_fiber_swap) ":\n"
     "    stp x19, x20, [x0, #0]\n"
     "    stp x21, x22, [x0, #16]\n"
     "    stp x23, x24, [x0, #32]\n"
@@ -104,16 +115,16 @@ __asm__(
     "    ldp d12, d13, [x1, #136]\n"
     "    ldp d14, d15, [x1, #152]\n"
     "    ret\n"
-    ".size rex_fiber_swap, .-rex_fiber_swap\n"
+    REX_FIBER_SIZE(rex_fiber_swap)
     "\n"
     ".balign 4\n"
-    ".global rex_fiber_entry\n"
-    ".type rex_fiber_entry, %function\n"
-    "rex_fiber_entry:\n"
+    ".global " REX_FIBER_SYM(rex_fiber_entry) "\n"
+    REX_FIBER_TYPE(rex_fiber_entry)
+    REX_FIBER_SYM(rex_fiber_entry) ":\n"
     "    mov x29, #0\n"
     "    mov x30, #0\n"
-    "    b   rex_fiber_trampoline\n"
-    ".size rex_fiber_entry, .-rex_fiber_entry\n");
+    "    b   " REX_FIBER_SYM(rex_fiber_trampoline) "\n"
+    REX_FIBER_SIZE(rex_fiber_entry));
 
 namespace rex::thread {
 

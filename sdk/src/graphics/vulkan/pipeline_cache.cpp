@@ -14,6 +14,8 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <set>
 #include <string>
@@ -1156,6 +1158,18 @@ bool VulkanPipelineCache::ConfigurePipeline(
   auto it = pipelines_.find(description);
   if (it != pipelines_.end()) {
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+    if (found_pipeline == VK_NULL_HANDLE && use_async &&
+        it->second.is_placeholder.load(std::memory_order_acquire)) {
+      // Still being created by a background thread (see below): the draw is skipped by the
+      // caller (is_placeholder), never created here on the command processor thread.
+      last_pipeline_ = &*it;
+      pipeline_out = VK_NULL_HANDLE;
+      pipeline_layout_out = nullptr;
+      if (pipeline_handle_out) {
+        *pipeline_handle_out = &it->second;
+      }
+      return true;
+    }
     if (found_pipeline == VK_NULL_HANDLE) {
       PipelineCreationArguments creation_arguments;
       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
@@ -1186,22 +1200,19 @@ bool VulkanPipelineCache::ConfigurePipeline(
 
   bool queued_async_creation = false;
   if (use_async) {
+    // No placeholder pipeline: building one (the real vertex shader with a discarding pixel
+    // shader) compiled the vertex shader synchronously here, on the command processor thread -
+    // measured 100-600 ms hitches on an iPhone whenever a new pipeline appeared in play. The
+    // real pipeline is only queued for the creation threads; until it exists, its draws are
+    // skipped (is_placeholder with no pipeline).
     creation_arguments_real.priority = async_priority;
-    PipelineCreationArguments creation_arguments_placeholder;
-    if (TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
-                                                      creation_arguments_placeholder, true)) {
-      pipeline.second.is_placeholder.store(true, std::memory_order_release);
-      if (EnsurePipelineCreated(creation_arguments_placeholder, placeholder_pixel_shader_)) {
-        {
-          std::lock_guard<std::mutex> lock(creation_request_lock_);
-          creation_queue_.push(creation_arguments_real);
-        }
-        creation_request_cond_.notify_one();
-        queued_async_creation = true;
-      } else {
-        pipeline.second.is_placeholder.store(false, std::memory_order_release);
-      }
+    pipeline.second.is_placeholder.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      creation_queue_.push(creation_arguments_real);
     }
+    creation_request_cond_.notify_one();
+    queued_async_creation = true;
   }
 
   if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
@@ -1230,7 +1241,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
   if (pipeline_handle_out) {
     *pipeline_handle_out = &pipeline.second;
   }
-  return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
+  return queued_async_creation || (pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr);
 }
 
 bool VulkanPipelineCache::IsCreatingPipelines() const {
@@ -1272,6 +1283,19 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
   }
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;
+  }
+  // dump_shaders: also write the translated SPIR-V (one file per modification), for offline
+  // inspection with spirv-dis / spirv-cross.
+  if (!REXCVAR_GET(dump_shaders).empty()) {
+    std::error_code dump_ec;
+    std::filesystem::path dump_dir(REXCVAR_GET(dump_shaders));
+    std::filesystem::create_directories(dump_dir, dump_ec);
+    const std::vector<uint8_t>& spirv = translation.translated_binary();
+    std::ofstream(dump_dir / fmt::format("spv_{:016X}_{:016X}.{}.spv", shader.ucode_data_hash(),
+                                         translation.modification(),
+                                         shader.type() == xenos::ShaderType::kVertex ? "vs" : "ps"),
+                  std::ios::binary)
+        .write(reinterpret_cast<const char*>(spirv.data()), std::streamsize(spirv.size()));
   }
 
   // TODO(Triang3l): Log that the shader has been successfully translated in
@@ -3577,6 +3601,10 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
 
     bool created = EnsurePipelineCreated(creation_arguments);
     if (!created) {
+      REXGPU_WARN("VulkanPipelineCache: background creation of a pipeline failed (VS {:016X}, PS "
+                  "{:016X}); its draws stay skipped",
+                  creation_arguments.pipeline->first.vertex_shader_hash,
+                  creation_arguments.pipeline->first.pixel_shader_hash);
       bool has_placeholder =
           creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
       VkPipeline pipeline =

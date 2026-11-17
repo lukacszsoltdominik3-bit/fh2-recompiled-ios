@@ -150,6 +150,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
+  // gpu_rotulos: debug labels after draws / dispatches / copies (see the cvar).
+  bool AreDebugLabelsEnabled() const;
+
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
         ->vulkan_device();
@@ -166,6 +169,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
 
   bool submission_open() const { return submission_open_; }
+  // gpu_uploads_antecipados: whether shared memory uploads may go to the start of the submission, and the command
+  // buffer for them (barriers against earlier submissions are recorded on its first use in a submission).
+  bool AreUploadsHoisted() const;
+  DeferredCommandBuffer& upload_command_buffer();
   uint64_t GetCurrentSubmission() const {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
   }
@@ -586,6 +593,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+  // gpu_uploads_antecipados: shared memory uploads recorded here run before deferred_command_buffer_ in the same
+  // Vulkan command buffer, so they do not end the render pass in progress.
+  DeferredCommandBuffer upload_command_buffer_;
+  bool upload_command_buffer_used_ = false;
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;
@@ -775,6 +786,16 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+  // occlusion_query_assincrono: queries ended but not read back yet (their submission still running), and the
+  // last result read for each guest sample count address (given to the game at the next end of that query).
+  struct PendingOcclusionQuery {
+    uint32_t sample_count_address;
+    uint32_t host_index;
+    uint64_t submission;
+  };
+  std::vector<PendingOcclusionQuery> occlusion_queries_pending_;
+  std::unordered_map<uint32_t, uint64_t> occlusion_query_last_samples_;
+  void CollectCompletedOcclusionQueries();
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

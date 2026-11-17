@@ -8,6 +8,7 @@
 // fh2_perfil_duracao_s seconds it writes fh2_perfil.txt next to the log: one line per address, "count library
 // offset", most frequent first. Symbolize with tools/perfil_simbolos.py (addr2line).
 
+#if defined(__linux__)
 #include <dlfcn.h>
 #include <signal.h>
 #include <unwind.h>
@@ -15,6 +16,7 @@
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +43,7 @@ REXCVAR_DEFINE_STRING(fh2_perfil_thread, "GPU Commands", "FH2",
                       "Debug: the sampled thread, by the start of its name")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+#if defined(__linux__)
 namespace {
 
 constexpr size_t kMaxSamples = 1 << 20;
@@ -272,10 +275,13 @@ void Run() {
 }
 
 }  // namespace
+#endif  // __linux__
 
 // Called from OnPostSetup (fh2_app.h).
 void Fh2PerfilStart() {
+#if defined(__linux__)
   if (REXCVAR_GET(fh2_perfil_s) > 0.0) {
     std::thread(Run).detach();
   }
+#endif
 }

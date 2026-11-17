@@ -10,6 +10,9 @@
  */
 
 #include <climits>
+#include <cstdio>
+#include <string>
+#include <vector>
 #include <cmath>
 #include <memory>
 #include <sstream>
@@ -27,6 +30,11 @@ REXCVAR_DEFINE_INT32(gpu_teste_tfetch3d, 0, "GPU",
                      "Debug for 3D texture fetches: 0 = normal; 1 = return the coordinates "
                      "(x, y, z, 1), which is what an identity color grading LUT returns; 2 = return "
                      "the sum of the four sampled channels in x, y and z (zero = empty texture)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(gpu_tfetch_lod_explicito, "", "GPU",
+                      "Comma-separated pixel shader hashes (hex) whose texture fetches use the "
+                      "explicit LOD instead of derivatives (for shaders that take derivatives in "
+                      "non-uniform control flow and hang the host GPU)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::graphics {
@@ -587,6 +595,34 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     // Whether to use gradients (implicit or explicit) for LOD calculation.
     bool use_computed_lod = instr.attributes.use_computed_lod &&
                             (is_pixel_shader() || instr.attributes.use_register_gradients);
+    // gpu_tfetch_lod_explicito: shaders (by ucode hash) whose fetches use the explicit LOD
+    // (fetch constant LOD + biases) instead of derivatives - for shaders that take derivatives
+    // in non-uniform control flow (inside guest loops / predicated blocks), which is undefined
+    // and can hang the GPU on Metal.
+    if (use_computed_lod && !instr.attributes.use_register_gradients &&
+        instr.opcode == ucode::FetchOpcode::kTextureFetch) {
+      static const std::vector<uint64_t> explicit_lod_shaders = [] {
+        std::vector<uint64_t> hashes;
+        const std::string list = REXCVAR_GET(gpu_tfetch_lod_explicito);
+        size_t pos = 0;
+        while (pos < list.size()) {
+          size_t end = list.find(',', pos);
+          if (end == std::string::npos) end = list.size();
+          unsigned long long hash = 0;
+          if (std::sscanf(list.substr(pos, end - pos).c_str(), "%llx", &hash) == 1 && hash) {
+            hashes.push_back(hash);
+          }
+          pos = end + 1;
+        }
+        return hashes;
+      }();
+      for (uint64_t hash : explicit_lod_shaders) {
+        if (current_shader().ucode_data_hash() == hash) {
+          use_computed_lod = false;
+          break;
+        }
+      }
+    }
     if (instr.opcode == ucode::FetchOpcode::kGetTextureComputedLod &&
         (!use_computed_lod || instr.attributes.use_register_gradients)) {
       assert_always();
@@ -1191,6 +1227,19 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               builder_->createNoContractionBinOp(spv::OpFMul, type_float_, coordinates[i],
                                                  const_float_2),
               const_float_minus_3);
+          // Non-finite face coordinates (from a degenerate direction in the guest's cube
+          // instruction) would reach the sampler as a NaN / infinite direction - replace with
+          // the face center. Tested on the exponent bits so fast math can't remove the check.
+          spv::Id exponent_mask = builder_->makeUintConstant(0x7F800000u);
+          spv::Id is_non_finite = builder_->createBinOp(
+              spv::OpIEqual, type_bool_,
+              builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint_,
+                  builder_->createUnaryOp(spv::OpBitcast, type_uint_, coordinates[i]),
+                  exponent_mask),
+              exponent_mask);
+          coordinates[i] = builder_->createTriOp(spv::OpSelect, type_float_, is_non_finite,
+                                                 const_float_0_, coordinates[i]);
         }
         // Get the face index (floored, within 0...5 - OpConvertFToU is
         // undefined for out-of-range values, so clamping from both sides
@@ -1622,6 +1671,41 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               gradients_v = builder_->createNoContractionBinOp(
                   spv::OpVectorTimesScalar, type_float3_, gradients_v, lod_gradient_scale);
             } break;
+          }
+          // Replace non-finite gradient components with 0. Derivatives taken in non-uniform
+          // control flow (a fetch inside a guest loop or a predicated block, where the other
+          // pixels of the quad may hold unrelated or NaN values) are undefined, and NaN or
+          // infinite gradients given to the sampler hung the GPU on Apple hardware (Forza
+          // Horizon 2 Autoshow: a cube map convolution with tfetchCube in nested loops).
+          if (gradients_h != spv::NoResult && gradients_v != spv::NoResult) {
+            // Tested on the exponent bits rather than with OpIsNan / OpIsInf: with fast math
+            // (MoltenVK's default for these shaders) the Metal compiler may assume that NaN and
+            // infinity never occur and remove those checks.
+            auto sanitize_gradient = [this](spv::Id gradient) {
+              int component_count = builder_->getNumComponents(gradient);
+              spv::Id bool_type = type_bool_vectors_[component_count - 1];
+              spv::Id uint_type = type_uint_vectors_[component_count - 1];
+              spv::Id exponent_mask = builder_->makeUintConstant(0x7F800000u);
+              spv::Id exponent_mask_vector = exponent_mask;
+              if (component_count > 1) {
+                id_vector_temp_.clear();
+                for (int i = 0; i < component_count; ++i) {
+                  id_vector_temp_.push_back(exponent_mask);
+                }
+                exponent_mask_vector = builder_->makeCompositeConstant(uint_type, id_vector_temp_);
+              }
+              spv::Id is_non_finite = builder_->createBinOp(
+                  spv::OpIEqual, bool_type,
+                  builder_->createBinOp(spv::OpBitwiseAnd, uint_type,
+                                        builder_->createUnaryOp(spv::OpBitcast, uint_type, gradient),
+                                        exponent_mask_vector),
+                  exponent_mask_vector);
+              return builder_->createTriOp(spv::OpSelect, builder_->getTypeId(gradient),
+                                           is_non_finite,
+                                           const_float_vectors_0_[component_count - 1], gradient);
+            };
+            gradients_h = sanitize_gradient(gradients_h);
+            gradients_v = sanitize_gradient(gradients_v);
           }
         }
 

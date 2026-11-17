@@ -45,3 +45,6 @@ imgui.ini
 
 # Local changes log (kept on disk, not published)
 docs/alteracoes_fh2.md
+
+# App icon artwork (Forza Horizon 2 box art, copyrighted): local builds only, never committed.
+app/ios/Assets.xcassets/AppIcon.appiconset/*.png

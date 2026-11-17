@@ -181,6 +181,14 @@ class DeferredCommandBuffer {
                 sizeof(VkBufferCopy) * region_count);
   }
 
+  // Debug label (Metal debug signpost under MoltenVK) - see gpu_rotulos.
+  void CmdVkInsertDebugLabel(const char* text) {
+    auto& args = *reinterpret_cast<ArgsVkInsertDebugLabel*>(
+        WriteCommand(Command::kVkInsertDebugLabel, sizeof(ArgsVkInsertDebugLabel)));
+    std::strncpy(args.text, text, sizeof(args.text) - 1);
+    args.text[sizeof(args.text) - 1] = '\0';
+  }
+
   void CmdVkBeginQuery(VkQueryPool query_pool, uint32_t query, VkQueryControlFlags flags) {
     auto& args = *reinterpret_cast<ArgsVkBeginQuery*>(
         WriteCommand(Command::kVkBeginQuery, sizeof(ArgsVkBeginQuery)));
@@ -405,6 +413,11 @@ class DeferredCommandBuffer {
     kVkSetStencilWriteMask,
     kVkSetViewport,
     kVkWriteTimestamp,
+    kVkInsertDebugLabel,
+  };
+
+  struct ArgsVkInsertDebugLabel {
+    char text[72];
   };
 
   struct CommandHeader {

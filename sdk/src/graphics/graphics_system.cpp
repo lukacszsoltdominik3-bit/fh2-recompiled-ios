@@ -186,7 +186,15 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           // still never comes early, so the 60 fps cap holds.
           if (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
-            last_frame_time = current_time;
+            // Advance on the ideal 60 Hz grid rather than from the wake-up time: a timed wait
+            // that oversleeps (2-3 ms is common for a timer on iOS) would otherwise lengthen every
+            // vblank period, measured 52.8 Hz on an iPhone - FH2 steps every second vblank, so
+            // 26.4 fps everywhere. Only when a whole vblank is missed does the grid jump to now
+            // (no burst of catch-up vblanks).
+            last_frame_time += interval_ticks;
+            if (current_time - last_frame_time >= interval_ticks) {
+              last_frame_time = current_time;
+            }
             NotifyVblank();
           }
           const uint64_t ticks_left = last_frame_time + interval_ticks - current_time;

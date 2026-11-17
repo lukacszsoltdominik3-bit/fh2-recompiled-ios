@@ -23,6 +23,7 @@
 #include <rex/ppc/function.h>
 #include <rex/runtime.h>
 #include <rex/stream.h>
+#include <rex/system/static_module_registry.h>
 #include <rex/thread/atomic.h>
 #include <rex/string.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -843,15 +844,26 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
     }
 
     rex::platform::DynamicLibrary library_local;
-    if (!library_local.Load(std::filesystem::path(recomp->shared_lib_name),
-                            rex::platform::SymbolResolution::kImmediate)) {
+    runtime::FunctionDispatcher::RegisterFn register_func = nullptr;
+    using GetImageInfoFn = const rex::PPCImageInfo* (*)();
+    GetImageInfoFn get_image_info = nullptr;
+    bool lib_load_ok = library_local.Load(std::filesystem::path(recomp->shared_lib_name),
+                                          rex::platform::SymbolResolution::kImmediate);
+    if (lib_load_ok) {
+      register_func = reinterpret_cast<runtime::FunctionDispatcher::RegisterFn>(
+          library_local.GetRawSymbol("ReXModule_Register"));
+      get_image_info =
+          reinterpret_cast<GetImageInfoFn>(library_local.GetRawSymbol("ReXModule_GetImageInfo"));
+    } else if (const auto* entry = rex::system::LookupStaticModule(recomp->shared_lib_name.c_str())) {
+      // iOS: module was linked statically into the host; LookupStaticModule
+      // resolves the renamed Register / GetImageInfo symbols.
+      register_func = entry->register_fn;
+      get_image_info = entry->get_image_info_fn;
+      lib_load_ok = true;
+    }
+    if (!lib_load_ok) {
       REXSYS_ERROR("Failed to load shared library for module '{}'", recomp->pe_name);
     } else {
-      auto register_func = reinterpret_cast<runtime::FunctionDispatcher::RegisterFn>(
-          library_local.GetRawSymbol("ReXModule_Register"));
-      using GetImageInfoFn = const rex::PPCImageInfo* (*)();
-      auto get_image_info =
-          reinterpret_cast<GetImageInfoFn>(library_local.GetRawSymbol("ReXModule_GetImageInfo"));
       if (!register_func) {
         REXSYS_ERROR("ReXModule_Register not found in '{}'", recomp->shared_lib_name);
       } else if (!get_image_info) {
@@ -906,6 +918,8 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
       uint64_t args[] = {module->hmodule_ptr(), 1 /* DLL_PROCESS_ATTACH */, 0};
       uint64_t dllmain_ret =
           function_dispatcher_->Execute(thread->thread_state(), module->entry_point(), args, 3);
+      REXSYS_INFO("DllMain(ATTACH) '{}' returned {:08X}", module->name(),
+                  static_cast<uint32_t>(dllmain_ret));
       if (static_cast<uint32_t>(dllmain_ret) == 0) {
         REXSYS_ERROR("DllMain(DLL_PROCESS_ATTACH) returned FALSE for '{}'; rolling back load",
                      module->name());

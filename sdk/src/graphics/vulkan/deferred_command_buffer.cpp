@@ -272,6 +272,18 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
             reinterpret_cast<const uint8_t*>(stream) + sizeof(ArgsVkPushConstants));
       } break;
 
+      case Command::kVkInsertDebugLabel: {
+        auto& args = *reinterpret_cast<const ArgsVkInsertDebugLabel*>(stream);
+        const ui::vulkan::VulkanInstance* instance =
+            command_processor_.GetVulkanDevice()->vulkan_instance();
+        if (instance->extensions().ext_EXT_debug_utils &&
+            instance->functions().vkCmdInsertDebugUtilsLabelEXT) {
+          VkDebugUtilsLabelEXT label = {VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+          label.pLabelName = args.text;
+          instance->functions().vkCmdInsertDebugUtilsLabelEXT(command_buffer, &label);
+        }
+      } break;
+
       case Command::kVkWriteTimestamp: {
         auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
         dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage, args.query_pool, args.query);

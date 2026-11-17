@@ -34,6 +34,7 @@ void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  submission_touched_.assign(num_system_page_flags_, 0);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -254,10 +255,54 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
   }
 }
 
+void SharedMemory::ResetSubmissionTouched() {
+  std::fill(submission_touched_.begin(), submission_touched_.end(), uint64_t(0));
+}
+
+void SharedMemory::MarkSubmissionTouched(uint32_t start, uint32_t length) {
+  if (length == 0 || start >= kBufferSize || submission_touched_.empty()) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t i = page_first >> 6; i <= (page_last >> 6); ++i) {
+    uint64_t bits = UINT64_MAX;
+    if (i == (page_first >> 6)) {
+      bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == (page_last >> 6) && (page_last & 63) != 63) {
+      bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    submission_touched_[i] |= bits;
+  }
+}
+
+bool SharedMemory::AnySubmissionTouched(uint32_t page_first, uint32_t page_count) const {
+  if (!page_count || submission_touched_.empty()) {
+    return false;
+  }
+  uint32_t page_last = page_first + page_count - 1;
+  for (uint32_t i = page_first >> 6; i <= (page_last >> 6); ++i) {
+    uint64_t bits = UINT64_MAX;
+    if (i == (page_first >> 6)) {
+      bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == (page_last >> 6) && (page_last & 63) != 63) {
+      bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (submission_touched_[i] & bits) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   if (length == 0 || start >= kBufferSize) {
     return;
   }
+  MarkSubmissionTouched(start, length);
   length = std::min(length, kBufferSize - start);
   uint32_t end = start + length - 1;
   uint32_t page_first = start >> page_size_log2_;
@@ -461,11 +506,12 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
                     uint32_t(upload_ranges_.size()));
 
-  if (upload_ranges_.empty()) {
-    return true;
+  // Upload first (it decides by what earlier commands touched), then count this request's ranges as touched.
+  bool uploaded = upload_ranges_.empty() || UploadRanges(upload_ranges_);
+  for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+    MarkSubmissionTouched(range.first, range.second);
   }
-
-  return UploadRanges(upload_ranges_);
+  return uploaded;
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {

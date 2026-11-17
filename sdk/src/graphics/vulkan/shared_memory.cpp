@@ -16,6 +16,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/cp_times.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
@@ -280,6 +281,25 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  if (!command_processor_.AreUploadsHoisted()) {
+    return UploadPageRanges(upload_page_ranges, false);
+  }
+  // Pages no command recorded earlier in this submission read or wrote: copied at its start, so the render pass
+  // in progress goes on. The others in place, after the commands that use the old data.
+  upload_ranges_hoisted_.clear();
+  upload_ranges_in_place_.clear();
+  for (const auto& range : upload_page_ranges) {
+    (AnySubmissionTouched(range.first, range.second) ? upload_ranges_in_place_ : upload_ranges_hoisted_)
+        .push_back(range);
+  }
+  if (!upload_ranges_hoisted_.empty() && !UploadPageRanges(upload_ranges_hoisted_, true)) {
+    return false;
+  }
+  return upload_ranges_in_place_.empty() || UploadPageRanges(upload_ranges_in_place_, false);
+}
+
+bool VulkanSharedMemory::UploadPageRanges(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges, bool hoisted) {
 #if REX_PLATFORM_SWITCH
   {
     uint64_t pages = 0;
@@ -289,15 +309,27 @@ bool VulkanSharedMemory::UploadRanges(
     RexSwitchPerfAdd(15, pages << page_size_log2());
   }
 #endif
-  // upload_page_ranges are sorted, use them to determine the range for the
-  // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
-                         << page_size_log2()));
-  command_processor_.SubmitBarriers(true);
-  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  if (!hoisted) {
+    // upload_page_ranges are sorted, use them to determine the range for the
+    // ordering barrier.
+    Use(Usage::kTransferDestination,
+        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
+                        upload_page_ranges.front().first)
+                           << page_size_log2()));
+    command_processor_.SubmitBarriers(true);
+  }
+  (hoisted ? g_cp_times.shm_uploads_hoisted : g_cp_times.shm_uploads)
+      .fetch_add(1, std::memory_order_relaxed);
+  {
+    uint64_t pages = 0;
+    for (const auto& range : upload_page_ranges) {
+      pages += range.second;
+    }
+    g_cp_times.shm_upload_bytes.fetch_add(pages << page_size_log2(), std::memory_order_relaxed);
+  }
+  DeferredCommandBuffer& command_buffer = hoisted ? command_processor_.upload_command_buffer()
+                                                  : command_processor_.deferred_command_buffer();
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
   upload_regions_.clear();

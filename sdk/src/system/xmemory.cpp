@@ -15,6 +15,8 @@
 
 #if REX_PLATFORM_MAC
 #include <sys/mman.h>
+#include <unistd.h>
+#include <cerrno>
 #endif
 
 #include <fmt/format.h>
@@ -157,6 +159,21 @@ bool Memory::Initialize() {
     return false;
   }
   mapping_base_ = views_.all_views[0];
+#if REX_PLATFORM_IOS
+  // iOS keeps the first mapped page of a MAP_FIXED-over-MAP_ANONYMOUS region
+  // read-protected despite PROT_READ|PROT_WRITE in the mmap call. The guest
+  // (Xbox 360) expects page 0 to be an accessible zero page — null-ptr writes
+  // and reads it hits every time XMedia / XMA tears down a stream. Force the
+  // first guest page to RW with mprotect so those null-ish accesses no-op
+  // the way they did on the console.
+  {
+    const size_t page = sysconf(_SC_PAGESIZE);
+    if (mprotect(mapping_base_, page, PROT_READ | PROT_WRITE) != 0) {
+      REXSYS_ERROR("Memory::Initialize: iOS mprotect of guest page 0 failed: {}",
+                   std::strerror(errno));
+    }
+  }
+#endif
 #elif REX_PLATFORM_SWITCH
   // Horizon does not allow fixed addresses: the kernel chooses the guest window,
   // which CreateFileMappingHandle reserved. We ask where it ended up and carve the

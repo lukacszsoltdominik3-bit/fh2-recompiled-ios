@@ -4,7 +4,7 @@
 
 **Uma recompilação estática não oficial de Forza Horizon 2 (Xbox 360) para Android e Linux**
 
-[English](README.md) · [Avisos de terceiros](THIRD_PARTY_NOTICES.md) · [Licença: GPL-3.0](LICENSE)
+[English](README.upstream.md) · [Avisos de terceiros](THIRD_PARTY_NOTICES.md) · [Licença: GPL-3.0](LICENSE)
 
 </div>
 

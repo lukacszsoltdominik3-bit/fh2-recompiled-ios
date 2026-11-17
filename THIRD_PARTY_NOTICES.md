@@ -64,3 +64,19 @@ This project uses these files of the SDK's third-party tree in a modified form; 
 The rest of FFmpeg and libmspack is the unmodified upstream source at the commits pinned by ReXGlue SDK v0.10.0.
 Everything needed to rebuild and relink the application with a modified version of either library is in this
 repository and its build instructions.
+
+### MoltenVK and Vulkan-Loader (iOS port, Apache-2.0)
+
+The iOS port uses [MoltenVK](https://github.com/KhronosGroup/MoltenVK) (Apache-2.0) and the
+[Vulkan-Loader](https://github.com/KhronosGroup/Vulkan-Loader) (Apache-2.0), both linked statically, with these
+files of the SDK's third-party tree modified; the modified copies are in `sdk/thirdparty`, and the changes are marked
+`(fh2)` in the MoltenVK sources:
+
+- `moltenvk/MoltenVK/MoltenVK/GPUObjects/MVKImage.h`, `MVKImage.mm` and `MVKQueue.mm`: a fix for a use-after-free of
+  `CAMetalDrawable` in the present path
+- `moltenvk/MoltenVK/CMakeLists.txt` and `moltenvk/Common/CMakeLists.txt`: a static build that links UIKit on iOS
+- `vulkan-loader/loader/CMakeLists.txt`: a static loader on iOS, without the macOS framework target
+
+The rest of MoltenVK and the Vulkan-Loader is the unmodified upstream source at the commits pinned by ReXGlue SDK
+v0.10.0.
+

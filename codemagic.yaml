@@ -1,9 +1,41 @@
+
 workflows:
+  fh2-ios-unsigned:
+    name: FH2 iOS - Unsigned Build
+    max_build_duration: 120
+    instance_type: mac_mini_m2
 
-    sample-workflow:
+    environment:
+      xcode: latest
+      cocoapods: default
 
-        name: Codemagic Sample Workflow
+      vars:
+        XCODE_PROJECT: "YOUR_PROJECT.xcodeproj"
+        XCODE_SCHEME: "YOUR_SCHEME"
 
-        max_build_duration: 120
+    scripts:
+      - name: Check project files
+        script: |
+          echo "Project directory:"
+          pwd
+          echo "Available Xcode projects:"
+          find . -name "*.xcodeproj" -maxdepth 4
+          echo "Available workspaces:"
+          find . -name "*.xcworkspace" -maxdepth 4
 
-        instance_type: mac_mini_m2
+      - name: Build unsigned iOS app
+        script: |
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+    artifacts:
+      - build/Build/Products/Debug-iphoneos/*.app
+      - /tmp/xcodebuild_logs/*.log
